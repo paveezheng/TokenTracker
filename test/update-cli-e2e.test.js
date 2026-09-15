@@ -27,6 +27,10 @@ function writeFakeNpm(tmp) {
     npmPath,
     [
       "#!/bin/sh",
+      "if [ \"$1\" = root ] && [ \"$2\" = -g ]; then",
+      "  printf '%s\\n' \"$TOKENTRACKER_TEST_NPM_ROOT\"",
+      "  exit 0",
+      "fi",
       "printf '%s\\n' \"$*\" >> \"${TOKENTRACKER_TEST_NPM_LOG}\"",
       "exit \"${TOKENTRACKER_TEST_NPM_EXIT:-0}\"",
       "",
@@ -54,6 +58,7 @@ test("npm-prefix layout runs npm install -g and does not treat the tree as a git
     const res = runTracker(entry, ["update"], {
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ""}`,
       TOKENTRACKER_TEST_NPM_LOG: npmLog,
+      TOKENTRACKER_TEST_NPM_ROOT: path.join(tmp, "lib", "node_modules"),
     });
     const text = `${res.stdout}${res.stderr}`;
     assert.equal(res.status, 0, text);
@@ -77,6 +82,7 @@ test("npm-prefix update forwards a failing npm exit code", () => {
     const res = runTracker(entry, ["update"], {
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ""}`,
       TOKENTRACKER_TEST_NPM_LOG: npmLog,
+      TOKENTRACKER_TEST_NPM_ROOT: path.join(tmp, "lib", "node_modules"),
       TOKENTRACKER_TEST_NPM_EXIT: "3",
     });
     assert.equal(res.status, 3);

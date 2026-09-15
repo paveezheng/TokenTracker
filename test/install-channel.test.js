@@ -12,10 +12,38 @@ const {
   BREW_FORMULA,
 } = require("../src/lib/install-channel");
 
-function detect(entryPath) {
+function commandForEntry(entryPath) {
+  const posix = entryPath.replace(/\\/g, "/");
+  if (posix.includes("/.bun/install/global/")) {
+    const bunRoot = posix.slice(0, posix.indexOf("/install/global/"));
+    return (_bin, args) => {
+      assert.deepEqual(args, ["pm", "bin", "-g"]);
+      return `${bunRoot}/bin\n`;
+    };
+  }
+  if (posix.includes("/yarn/global/node_modules/")) {
+    const globalDir = posix.slice(0, posix.indexOf("/node_modules/"));
+    return (_bin, args) => {
+      assert.deepEqual(args, ["global", "dir"]);
+      return `${globalDir}\n`;
+    };
+  }
+  const nodeModules = posix.indexOf("/node_modules/");
+  if (nodeModules >= 0) {
+    const root = posix.slice(0, nodeModules + "/node_modules".length);
+    return (_bin, args) => {
+      assert.deepEqual(args, ["root", "-g"]);
+      return `${root}\n`;
+    };
+  }
+  return () => "";
+}
+
+function detect(entryPath, execFileSync = commandForEntry(entryPath)) {
   return detectInstallChannel({
     entryPath,
     realpathSync: (p) => p,
+    execFileSync,
   });
 }
 
@@ -74,6 +102,36 @@ test("detects npm, bun, pnpm, yarn, and npx from their install layouts", () => {
   assert.equal(npx.method, "npx");
   assert.equal(npx.action, null);
   assert.match(npx.reason, /npx tokentracker-cli@latest/);
+});
+
+test("refuses project-local npm and pnpm dependencies", () => {
+  const npm = detect(
+    "/project/node_modules/tokentracker-cli/bin/tracker.js",
+    () => "/home/u/.local/lib/node_modules\n",
+  );
+  assert.equal(npm.method, "other");
+  assert.equal(npm.action, null);
+  assert.match(npm.reason, /project-local dependency/);
+  assert.match(npm.reason, /npm global install/);
+
+  const pnpm = detect(
+    "/project/node_modules/.pnpm/tokentracker-cli@0.96.2/node_modules/tokentracker-cli/bin/tracker.js",
+    () => "/home/u/.local/share/pnpm/global/5/node_modules\n",
+  );
+  assert.equal(pnpm.method, "other");
+  assert.equal(pnpm.action, null);
+  assert.match(pnpm.reason, /project-local dependency/);
+  assert.match(pnpm.reason, /pnpm global install/);
+});
+
+test("refuses a global npm copy owned by a different npm prefix", () => {
+  const channel = detect(
+    "/home/u/.nvm/versions/node/v20.11.0/lib/node_modules/tokentracker-cli/bin/tracker.js",
+    () => "/home/u/.nvm/versions/node/v22.0.0/lib/node_modules\n",
+  );
+  assert.equal(channel.method, "other");
+  assert.equal(channel.action, null);
+  assert.match(channel.reason, /different global prefix/);
 });
 
 test("detects desktop EmbeddedServer bundles on POSIX and Windows paths", () => {

@@ -2,6 +2,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const { execFileSync } = require("node:child_process");
 
 const PACKAGE_NAME = "tokentracker-cli";
 const BREW_FORMULA = "xiufengsun/tokentracker/tokentracker";
@@ -19,9 +20,9 @@ function toPosix(p) {
   return String(p || "").replace(/\\/g, "/");
 }
 
-function resolveEntryPath(entryPath, realpathSync) {
+function resolveEntryPath(entryPath, realpathSync, pathApi = path) {
   if (typeof entryPath !== "string" || !entryPath.trim()) return "";
-  const resolved = path.resolve(entryPath.trim());
+  const resolved = pathApi.resolve(entryPath.trim());
   try {
     return realpathSync(resolved);
   } catch (_err) {
@@ -62,20 +63,53 @@ function isNpmPackagePath(posixLower) {
   return posixLower.includes(`/node_modules/${PACKAGE_NAME}/`);
 }
 
-function findSourceTree(entryPath, existsSync, readFileSync) {
+function commandOutput(runCommand, bin, args) {
+  try {
+    const output = runCommand(bin, args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return String(output || "").trim();
+  } catch (_err) {
+    return "";
+  }
+}
+
+function globalRootFor(method, runCommand, pathApi = path) {
+  if (method === "npm" || method === "pnpm") {
+    return commandOutput(runCommand, method, ["root", "-g"]);
+  }
+  if (method === "yarn") {
+    const globalDir = commandOutput(runCommand, "yarn", ["global", "dir"]);
+    return globalDir ? pathApi.join(globalDir, "node_modules") : "";
+  }
+  if (method === "bun") {
+    const globalBin = commandOutput(runCommand, "bun", ["pm", "bin", "-g"]);
+    return globalBin ? pathApi.resolve(globalBin, "..", "install", "global", "node_modules") : "";
+  }
+  return "";
+}
+
+function isWithinPath(child, parent, pathApi = path) {
+  if (!child || !parent) return false;
+  const relative = pathApi.relative(pathApi.resolve(parent), pathApi.resolve(child));
+  return relative === "" || (!relative.startsWith(`..${pathApi.sep}`) && relative !== ".." && !pathApi.isAbsolute(relative));
+}
+
+function findSourceTree(entryPath, existsSync, readFileSync, pathApi = path) {
   if (!entryPath) return null;
-  let dir = path.dirname(path.resolve(entryPath));
-  const { root } = path.parse(dir);
+  let dir = pathApi.dirname(pathApi.resolve(entryPath));
+  const { root } = pathApi.parse(dir);
   for (;;) {
-    const pkgPath = path.join(dir, "package.json");
-    const cliPath = path.join(dir, "src", "cli.js");
+    const pkgPath = pathApi.join(dir, "package.json");
+    const cliPath = pathApi.join(dir, "src", "cli.js");
     if (existsSync(pkgPath) && existsSync(cliPath)) {
       try {
         const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
         if (pkg && pkg.name === PACKAGE_NAME) {
           return {
             root: dir,
-            git: existsSync(path.join(dir, ".git")),
+            git: existsSync(pathApi.join(dir, ".git")),
           };
         }
       } catch (_err) {
@@ -83,7 +117,7 @@ function findSourceTree(entryPath, existsSync, readFileSync) {
       }
     }
     if (dir === root) return null;
-    const parent = path.dirname(dir);
+    const parent = pathApi.dirname(dir);
     if (parent === dir) return null;
     dir = parent;
   }
@@ -95,7 +129,7 @@ function formatCommandLine(action) {
   return [action.bin, ...args].join(" ");
 }
 
-function unmanagedReason({ method, entryPath, sourceRoot, git }) {
+function unmanagedReason({ method, entryPath, sourceRoot, git, unverifiedGlobal }) {
   if (method === "npx") {
     return (
       `This TokenTracker was launched via npx (${entryPath}). ` +
@@ -106,6 +140,13 @@ function unmanagedReason({ method, entryPath, sourceRoot, git }) {
     return (
       `This TokenTracker is bundled inside the desktop app (${entryPath}). ` +
       `Use the app's built-in updater, or download a new build from ${RELEASES_URL}`
+    );
+  }
+  if (unverifiedGlobal) {
+    return (
+      `This TokenTracker is not inside the active ${unverifiedGlobal} global install at ${entryPath}. ` +
+      "It may be a project-local dependency or belong to a different global prefix. " +
+      "Update the project dependency with its package manager; TokenTracker will not update another installation."
     );
   }
   if (sourceRoot && git) {
@@ -134,11 +175,15 @@ function detectInstallChannel({
   realpathSync,
   existsSync,
   readFileSync,
+  execFileSync: execFileSyncOverride,
+  platform = process.platform,
 } = {}) {
   const resolveReal = typeof realpathSync === "function" ? realpathSync : fs.realpathSync;
   const exists = typeof existsSync === "function" ? existsSync : fs.existsSync;
   const readFile = typeof readFileSync === "function" ? readFileSync : fs.readFileSync;
-  const resolved = resolveEntryPath(entryPath, resolveReal);
+  const runCommand = typeof execFileSyncOverride === "function" ? execFileSyncOverride : execFileSync;
+  const pathApi = platform === "win32" ? path.win32 : path;
+  const resolved = resolveEntryPath(entryPath, resolveReal, pathApi);
   const posixLower = toPosix(resolved).toLowerCase();
 
   let method = "other";
@@ -150,8 +195,16 @@ function detectInstallChannel({
   else if (isYarnGlobalPath(posixLower)) method = "yarn";
   else if (isNpmPackagePath(posixLower)) method = "npm";
 
-  const source =
-    method === "other" ? findSourceTree(resolved || entryPath, exists, readFile) : null;
+  const reportedGlobalRoot = UPDATE_ACTIONS[method] && method !== "brew"
+    ? globalRootFor(method, runCommand, pathApi)
+    : "";
+  const globalRoot = reportedGlobalRoot ? resolveEntryPath(reportedGlobalRoot, resolveReal, pathApi) : "";
+  const unverifiedGlobal = UPDATE_ACTIONS[method] && method !== "brew" && !isWithinPath(resolved, globalRoot, pathApi)
+    ? method
+    : null;
+  if (unverifiedGlobal) method = "other";
+
+  const source = method === "other" ? findSourceTree(resolved || entryPath, exists, readFile, pathApi) : null;
   const action = UPDATE_ACTIONS[method] || null;
 
   return {
@@ -166,6 +219,7 @@ function detectInstallChannel({
       entryPath: resolved || String(entryPath || ""),
       sourceRoot: source?.root || null,
       git: Boolean(source?.git),
+      unverifiedGlobal,
     }),
   };
 }

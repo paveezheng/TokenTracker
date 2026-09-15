@@ -19,6 +19,8 @@ async function cmdUpdate(argv = [], deps = {}) {
     realpathSync: deps.realpathSync,
     existsSync: deps.existsSync,
     readFileSync: deps.readFileSync,
+    execFileSync: deps.execFileSync,
+    platform: deps.platform,
   });
 
   stdout.write(`Detected install: ${channel.method}\n`);

@@ -26,6 +26,12 @@ function createStreams() {
   };
 }
 
+function globalRootForEntry(entryPath) {
+  const posix = String(entryPath || "").replace(/\\/g, "/");
+  const index = posix.indexOf("/node_modules/");
+  return index < 0 ? "" : posix.slice(0, index + "/node_modules".length);
+}
+
 async function runUpdate(argv, extra = {}) {
   const streams = createStreams();
   const prevExit = process.exitCode;
@@ -34,6 +40,7 @@ async function runUpdate(argv, extra = {}) {
     await cmdUpdate(argv, {
       entryPath: extra.entryPath,
       realpathSync: extra.realpathSync || ((p) => p),
+      execFileSync: extra.execFileSync || ((_bin, _args) => `${globalRootForEntry(extra.entryPath)}\n`),
       spawnSync: extra.spawnSync || ((bin, args) => {
         calls.push({ bin, args });
         return extra.spawnResult || { status: 0 };
