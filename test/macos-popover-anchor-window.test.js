@@ -179,13 +179,28 @@ test("menu-bar popover is anchored to an app-owned positioning window", () => {
 
   assert.match(
     source,
-    /private\s+var\s+popoverAnchorWindow:\s*NSWindow\?/,
+    /private\s+var\s+popoverAnchorWindow:\s*NSPanel\?/,
     "StatusBarController should keep an app-owned anchor window for stable popover positioning.",
   );
   assert.match(
     source,
-    /private\s+func\s+makePopoverAnchorWindow\(\)\s*->\s*NSWindow[\s\S]*styleMask:\s*\[\.borderless\][\s\S]*collectionBehavior\s*=\s*\[[^\]]*\.canJoinAllSpaces[^\]]*\.fullScreenAuxiliary[^\]]*\.ignoresCycle[^\]]*\.stationary[^\]]*\]/,
-    "The anchor window should be borderless, invisible, and allowed in full-screen Spaces.",
+    /private\s+func\s+makePopoverAnchorWindow\(\)\s*->\s*NSPanel\s*\{[\s\S]*?NSPanel\([\s\S]*?styleMask:\s*\[\.borderless,\s*\.nonactivatingPanel\][\s\S]*?hidesOnDeactivate\s*=\s*false[\s\S]*?collectionBehavior\s*=\s*\[[^\]]*\.canJoinAllSpaces[^\]]*\.fullScreenAuxiliary[^\]]*\.ignoresCycle[^\]]*\.stationary[^\]]*\]/,
+    "The anchor must be a borderless non-activating panel that stays up on deactivation: while the Dashboard is open the app is .regular, and a regular app's plain window is never admitted onto another app's full-screen Space.",
+  );
+  assert.match(
+    source,
+    /private\s+func\s+positionPopoverAnchorWindow[\s\S]*?discardPopoverAnchorWindow\(\)\s*let\s+window\s*=\s*makePopoverAnchorWindow\(\)/,
+    "Every open must build a new anchor: an anchor ordered in under .regular stayed pinned to a desktop Space for the rest of the process.",
+  );
+  assert.doesNotMatch(
+    source,
+    /popoverAnchorWindow\s*\?\?\s*makePopoverAnchorWindow\(\)/,
+    "The anchor must not be reused across opens.",
+  );
+  assert.match(
+    source,
+    /private\s+func\s+discardPopoverAnchorWindow\(\)\s*\{[\s\S]*?popoverAnchorWindow\s*=\s*nil[\s\S]*?removeChildWindow[\s\S]*?\.close\(\)/,
+    "Discarding the anchor must detach the reused popover window before closing it, or the next show skips attaching the popover to the new anchor.",
   );
   assert.match(
     source,

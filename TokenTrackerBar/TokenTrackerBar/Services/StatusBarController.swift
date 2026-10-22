@@ -26,7 +26,7 @@ final class StatusBarController: NSObject {
 
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let popover = NSPopover()
-    private var popoverAnchorWindow: NSWindow?
+    private var popoverAnchorWindow: NSPanel?
     private var popoverDismissMonitor: Any?
     /// systemUptime when the popover was last shown — the debounce reference for
     /// duplicated status-button action dispatches (full-screen menu bar reveal).
@@ -1027,14 +1027,26 @@ final class StatusBarController: NSObject {
         popoverWindow.setFrame(frame, display: true)
     }
 
-    private func makePopoverAnchorWindow() -> NSWindow {
+    // The anchor is a non-activating panel, not a plain window: while the
+    // Dashboard is open the app runs with the .regular activation policy, and a
+    // regular app's plain window is never admitted onto another app's
+    // full-screen Space — the child popover then lands on a desktop Space and
+    // stays invisible. Worse, an anchor ordered in under .regular stays pinned
+    // to that desktop even after the Dashboard closes and the app is back to
+    // .accessory, so every later full-screen open failed until relaunch. A
+    // .nonactivatingPanel is admitted under either policy, like the confetti,
+    // pet and Dynamic Island panels.
+    private func makePopoverAnchorWindow() -> NSPanel {
         let anchorSize = NSSize(width: 2, height: 1)
-        let window = NSWindow(
+        let window = NSPanel(
             contentRect: NSRect(origin: .zero, size: anchorSize),
-            styleMask: [.borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
+        // NSPanel hides on deactivation by default, which would take the child
+        // popover down with it whenever another app becomes active.
+        window.hidesOnDeactivate = false
         window.contentView = NSView(frame: NSRect(origin: .zero, size: anchorSize))
         window.backgroundColor = .clear
         window.alphaValue = 0
@@ -1073,11 +1085,25 @@ final class StatusBarController: NSObject {
             width: anchorSize.width,
             height: anchorSize.height
         )
-        let window = popoverAnchorWindow ?? makePopoverAnchorWindow()
+        // Build a new anchor for every open instead of reusing the last one, so
+        // no Space assignment from an earlier open (or an earlier activation
+        // policy) can carry over into this one.
+        discardPopoverAnchorWindow()
+        let window = makePopoverAnchorWindow()
         popoverAnchorWindow = window
         window.setFrame(anchorFrame, display: false)
         window.orderFrontRegardless()
         return window.contentView
+    }
+
+    private func discardPopoverAnchorWindow() {
+        guard let anchorWindow = popoverAnchorWindow else { return }
+        popoverAnchorWindow = nil
+        // Detach the reused popover window first: it must not stay a child of
+        // the old anchor, or the next show would skip attaching it to the new one.
+        anchorWindow.childWindows?.forEach { anchorWindow.removeChildWindow($0) }
+        anchorWindow.orderOut(nil)
+        anchorWindow.close()
     }
 
     // MARK: - Right-Click Menu
