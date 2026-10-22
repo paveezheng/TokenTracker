@@ -2,3 +2,4 @@
 
 - [TokenTracker issue and PR review, 2026-10-11](TokenTracker/2026-10-11-issue-pr-review.md)
 - [TokenTracker ZCode session review, 2026-10-11](TokenTracker/2026-10-11-zcode-session-review.md)
+- [TokenTracker menu bar popover over full-screen Spaces, 2026-10-22](TokenTracker/2026-10-22-macos-popover-fullscreen-spaces.md)
