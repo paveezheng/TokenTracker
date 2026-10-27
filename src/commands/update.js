@@ -147,16 +147,16 @@ function readInstalledVersion(packageRoot, fsImpl) {
   }
 }
 
-function writeLines(lines) {
-  if (lines.length) process.stdout.write(`${lines.join("\n")}\n`);
+function writeLines(stdout, lines) {
+  if (lines.length) stdout.write(`${lines.join("\n")}\n`);
 }
 
 // printed counts the leading lines already written before a spawn, so text
 // mode does not repeat them; JSON always carries the whole message.
-function emit(opts, payload, exitCode, printed = 0) {
+function emit(stdout, opts, payload, exitCode, printed = 0) {
   const lines = payload.lines.filter(Boolean);
   if (opts.json) {
-    process.stdout.write(`${JSON.stringify({
+    stdout.write(`${JSON.stringify({
       ok: payload.ok,
       current: payload.current,
       latest: payload.latest,
@@ -167,18 +167,22 @@ function emit(opts, payload, exitCode, printed = 0) {
       message: lines.join("\n"),
     })}\n`);
   } else {
-    writeLines(lines.slice(printed));
+    writeLines(stdout, lines.slice(printed));
   }
   process.exitCode = exitCode;
   return payload;
 }
 
 async function cmdUpdate(argv = [], deps = {}) {
+  // Injectable so tests never swap process.stdout: node:test reports a test
+  // file's results to the runner over that same stream.
+  const stdout = deps.stdout || process.stdout;
+  const stderr = deps.stderr || process.stderr;
   let opts;
   try {
     opts = parseArgs(argv);
   } catch (error) {
-    process.stderr.write(`${error.message}\n${USAGE}\n`);
+    stderr.write(`${error.message}\n${USAGE}\n`);
     process.exitCode = 1;
     return null;
   }
@@ -201,7 +205,7 @@ async function cmdUpdate(argv = [], deps = {}) {
   }
 
   if (fetchError) {
-    return emit(opts, {
+    return emit(stdout, opts, {
       ok: false,
       current,
       latest: null,
@@ -232,12 +236,12 @@ async function cmdUpdate(argv = [], deps = {}) {
       : (plan.channel === "npm" && plan.updateAvailable ? 1 : 0);
     // --check exits 1 when a newer release exists. ok stays true because the
     // check itself succeeded; updateAvailable carries the result.
-    return emit(opts, { ...plan, ok: opts.check || exitCode === 0, applied: false }, exitCode);
+    return emit(stdout, opts, { ...plan, ok: opts.check || exitCode === 0, applied: false }, exitCode);
   }
 
   // Say what is about to run before the installer's own output scrolls by.
   const header = plan.lines.filter(Boolean);
-  if (!opts.json) writeLines(header);
+  if (!opts.json) writeLines(stdout, header);
   const result = await runSpawn(spawnImpl, plan.exec, { pipe: opts.json });
   const lines = header.slice();
   let ok = result.code === 0;
@@ -266,7 +270,7 @@ async function cmdUpdate(argv = [], deps = {}) {
     }
   }
 
-  return emit(opts, { ...plan, ok, applied: ok, lines }, ok ? 0 : 1, header.length);
+  return emit(stdout, opts, { ...plan, ok, applied: ok, lines }, ok ? 0 : 1, header.length);
 }
 
 module.exports = { cmdUpdate, parseArgs };

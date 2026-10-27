@@ -1,8 +1,11 @@
 const assert = require("node:assert/strict");
+const { spawnSync } = require("node:child_process");
 const { EventEmitter } = require("node:events");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const { test } = require("node:test");
 
-const { run } = require("../src/cli");
 const { cmdUpdate } = require("../src/commands/update");
 const {
   compareVersions,
@@ -22,29 +25,25 @@ const WIN_ROOT = `${WIN_PREFIX}\\node_modules\\tokentracker-cli`;
 const BREW_ROOT = "/opt/homebrew/Cellar/tokentracker/1.4.7/libexec/lib/node_modules/tokentracker-cli";
 const BREW_LINKED = "/opt/homebrew/opt/tokentracker/libexec/lib/node_modules/tokentracker-cli";
 
-function capture(fn) {
-  const prevOut = process.stdout.write;
-  const prevErr = process.stderr.write;
+// cmdUpdate writes through injected streams. Swapping process.stdout.write
+// would also swallow the frames node:test writes there to report results,
+// which corrupted JSON.parse() on the Windows runner.
+function sink() {
+  const io = { out: "", err: "" };
+  io.stdout = { write: (chunk) => { io.out += String(chunk ?? ""); return true; } };
+  io.stderr = { write: (chunk) => { io.err += String(chunk ?? ""); return true; } };
+  return io;
+}
+
+async function runUpdate(argv, deps = {}, io = sink()) {
   const prevExit = process.exitCode;
-  let out = "";
-  let err = "";
-  process.stdout.write = (chunk) => {
-    out += String(chunk ?? "");
-    return true;
-  };
-  process.stderr.write = (chunk) => {
-    err += String(chunk ?? "");
-    return true;
-  };
   process.exitCode = undefined;
-  return Promise.resolve()
-    .then(fn)
-    .then((result) => ({ out, err, exitCode: process.exitCode, result }))
-    .finally(() => {
-      process.stdout.write = prevOut;
-      process.stderr.write = prevErr;
-      process.exitCode = prevExit;
-    });
+  try {
+    const result = await cmdUpdate(argv, { ...deps, stdout: io.stdout, stderr: io.stderr });
+    return { out: io.out, err: io.err, exitCode: process.exitCode, result };
+  } finally {
+    process.exitCode = prevExit;
+  }
 }
 
 function registry(version, status = 200) {
@@ -282,10 +281,10 @@ test("fetchLatestNpmVersion rejects a version that is not a release number", asy
 
 test("update --check reports a newer npm release without installing", async () => {
   const spawn = fakeSpawn({ npmPrefix: "/usr" });
-  const captured = await capture(() => cmdUpdate(["--check", "--json"], npmDeps({
+  const captured = await runUpdate(["--check", "--json"], npmDeps({
     fs: fakeFs({ files: [NPM_CLI] }),
     spawn: spawn.spawn,
-  })));
+  }));
   const payload = JSON.parse(captured.out);
   assert.equal(payload.ok, true);
   assert.equal(payload.updateAvailable, true);
@@ -298,15 +297,16 @@ test("update --check reports a newer npm release without installing", async () =
 });
 
 test("update installs the npm global prefix in place", async () => {
-  const fs = fakeFs({ files: [NPM_CLI], versions: { [NPM_ROOT]: "1.4.7" } });
+  const files = fakeFs({ files: [NPM_CLI], versions: { [NPM_ROOT]: "1.4.7" } });
+  const io = sink();
   const spawn = fakeSpawn({
     npmPrefix: "/usr",
     onSpawn() {
-      process.stdout.write("installer output\n");
-      fs.versions[NPM_ROOT] = "1.4.12";
+      io.stdout.write("installer output\n");
+      files.versions[NPM_ROOT] = "1.4.12";
     },
   });
-  const captured = await capture(() => cmdUpdate([], npmDeps({ fs, spawn: spawn.spawn })));
+  const captured = await runUpdate([], npmDeps({ fs: files, spawn: spawn.spawn }), io);
   assert.equal(captured.exitCode, 0);
   assert.equal(spawn.probes[0].command, NODE);
   assert.deepEqual(spawn.probes[0].args, [NPM_CLI, "prefix", "--global"]);
@@ -332,35 +332,35 @@ test("update installs the npm global prefix in place", async () => {
 
 test("update follows bin/npm to npm-cli.js and skips a bin/npm that is a shell wrapper", async () => {
   const linked = fakeSpawn({ npmPrefix: "/usr" });
-  await capture(() => cmdUpdate(["--check"], npmDeps({
+  await runUpdate(["--check"], npmDeps({
     fs: fakeFs({ links: { "/usr/bin/npm": "/opt/npm/bin/npm-cli.js" } }),
     spawn: linked.spawn,
-  })));
+  }));
   assert.equal(linked.probes[0].args[0], "/opt/npm/bin/npm-cli.js");
 
   const wrapped = fakeSpawn({ npmPrefix: "/usr" });
-  await capture(() => cmdUpdate(["--check"], npmDeps({
+  await runUpdate(["--check"], npmDeps({
     fs: fakeFs({ links: { "/usr/bin/npm": "/usr/share/npm/npm.sh" }, files: [NPM_CLI] }),
     spawn: wrapped.spawn,
-  })));
+  }));
   assert.equal(wrapped.probes[0].args[0], NPM_CLI);
 });
 
 test("update on Windows spawns node and npm-cli.js without a shell", async () => {
-  const fs = fakeFs({ files: [WIN_NPM_CLI], versions: { [WIN_ROOT]: "1.4.7" } });
+  const files = fakeFs({ files: [WIN_NPM_CLI], versions: { [WIN_ROOT]: "1.4.7" } });
   const spawn = fakeSpawn({
     npmPrefix: WIN_PREFIX,
     onSpawn() {
-      fs.versions[WIN_ROOT] = "1.4.12";
+      files.versions[WIN_ROOT] = "1.4.12";
     },
   });
-  const captured = await capture(() => cmdUpdate([], npmDeps({
+  const captured = await runUpdate([], npmDeps({
     packageRoot: WIN_ROOT,
     execPath: WIN_NODE,
     platform: "win32",
-    fs,
+    fs: files,
     spawn: spawn.spawn,
-  })));
+  }));
   assert.equal(captured.exitCode, 0);
   assert.equal(spawn.probes[0].command, WIN_NODE);
   assert.deepEqual(spawn.probes[0].args, [WIN_NPM_CLI, "prefix", "--global"]);
@@ -375,13 +375,13 @@ test("update on Windows spawns node and npm-cli.js without a shell", async () =>
 
 test("update on Windows without a bundled npm prints the command instead of running npm.cmd", async () => {
   const spawn = fakeSpawn({ npmPrefix: WIN_PREFIX });
-  const captured = await capture(() => cmdUpdate([], npmDeps({
+  const captured = await runUpdate([], npmDeps({
     packageRoot: WIN_ROOT,
     execPath: WIN_NODE,
     platform: "win32",
     fs: fakeFs(),
     spawn: spawn.spawn,
-  })));
+  }));
   assert.equal(spawn.probes.length + spawn.calls.length, 0);
   assert.equal(captured.exitCode, 1);
   assert.match(captured.out, /Could not find npm/);
@@ -390,11 +390,11 @@ test("update on Windows without a bundled npm prints the command instead of runn
 
 test("update refuses a lib/node_modules copy outside npm's global prefix", async () => {
   const spawn = fakeSpawn({ npmPrefix: "/usr/local" });
-  const captured = await capture(() => cmdUpdate([], npmDeps({
+  const captured = await runUpdate([], npmDeps({
     packageRoot: "/home/me/.volta/tools/image/packages/tokentracker-cli/lib/node_modules/tokentracker-cli",
     fs: fakeFs({ files: [NPM_CLI] }),
     spawn: spawn.spawn,
-  })));
+  }));
   assert.equal(spawn.probes.length, 1);
   assert.equal(spawn.calls.length, 0);
   assert.equal(captured.exitCode, 1);
@@ -403,20 +403,20 @@ test("update refuses a lib/node_modules copy outside npm's global prefix", async
 
 test("update compares npm's prefix after resolving its symlinks", async () => {
   const spawn = fakeSpawn({ npmPrefix: "/home/me/npm-global" });
-  const captured = await capture(() => cmdUpdate(["--check", "--json"], npmDeps({
+  const captured = await runUpdate(["--check", "--json"], npmDeps({
     packageRoot: "/data/npm-global/lib/node_modules/tokentracker-cli",
     fs: fakeFs({ files: [NPM_CLI], links: { "/home/me/npm-global": "/data/npm-global" } }),
     spawn: spawn.spawn,
-  })));
+  }));
   assert.match(JSON.parse(captured.out).message, /npm install --global --prefix \/data\/npm-global/);
 });
 
 test("update does not claim success when the npm install leaves the old version", async () => {
   const spawn = fakeSpawn({ npmPrefix: "/usr" });
-  const captured = await capture(() => cmdUpdate([], npmDeps({
+  const captured = await runUpdate([], npmDeps({
     fs: fakeFs({ files: [NPM_CLI], versions: { [NPM_ROOT]: "1.4.7" } }),
     spawn: spawn.spawn,
-  })));
+  }));
   assert.equal(spawn.calls.length, 1);
   assert.equal(captured.exitCode, 1);
   assert.match(captured.out, /still 1\.4\.7/);
@@ -424,11 +424,11 @@ test("update does not claim success when the npm install leaves the old version"
 
 test("update refuses an unwritable npm prefix", async () => {
   const spawn = fakeSpawn({ npmPrefix: "/usr" });
-  const captured = await capture(() => cmdUpdate([], npmDeps({
+  const captured = await runUpdate([], npmDeps({
     writable: false,
     fs: fakeFs({ files: [NPM_CLI] }),
     spawn: spawn.spawn,
-  })));
+  }));
   assert.equal(spawn.calls.length, 0);
   assert.equal(captured.exitCode, 1);
   assert.match(captured.out, /not writable: \/usr/);
@@ -436,20 +436,20 @@ test("update refuses an unwritable npm prefix", async () => {
 });
 
 test("update runs brew upgrade and confirms the version Homebrew linked", async () => {
-  const fs = fakeFs({ versions: { [BREW_LINKED]: "1.4.7" } });
+  const files = fakeFs({ versions: { [BREW_LINKED]: "1.4.7" } });
   const spawn = fakeSpawn({
     onSpawn() {
-      fs.versions[BREW_LINKED] = "1.4.12";
+      files.versions[BREW_LINKED] = "1.4.12";
     },
   });
-  const captured = await capture(() => cmdUpdate([], {
+  const captured = await runUpdate([], {
     packageRoot: BREW_ROOT,
     currentVersion: "1.4.7",
     platform: "darwin",
-    fs,
+    fs: files,
     fetch: registry("1.4.12"),
     spawn: spawn.spawn,
-  }));
+  });
   assert.equal(captured.exitCode, 0);
   assert.equal(spawn.calls[0].command, "brew");
   assert.deepEqual(spawn.calls[0].args, ["upgrade", "xiufengsun/tokentracker/tokentracker"]);
@@ -459,14 +459,14 @@ test("update runs brew upgrade and confirms the version Homebrew linked", async 
 
 test("update does not report applied when the Homebrew tap has not bumped yet", async () => {
   const spawn = fakeSpawn();
-  const captured = await capture(() => cmdUpdate(["--json"], {
+  const captured = await runUpdate(["--json"], {
     packageRoot: BREW_ROOT,
     currentVersion: "1.4.7",
     platform: "darwin",
     fs: fakeFs({ versions: { [BREW_LINKED]: "1.4.7" } }),
     fetch: registry("1.4.12"),
     spawn: spawn.spawn,
-  }));
+  });
   const payload = JSON.parse(captured.out);
   assert.equal(spawn.calls.length, 1);
   assert.equal(captured.exitCode, 1);
@@ -477,13 +477,13 @@ test("update does not report applied when the Homebrew tap has not bumped yet", 
 
 test("npx prints the next launch command and does not install", async () => {
   const spawn = fakeSpawn();
-  const captured = await capture(() => cmdUpdate([], {
+  const captured = await runUpdate([], {
     packageRoot: "/root/.npm/_npx/abc/node_modules/tokentracker-cli",
     currentVersion: "1.4.7",
     platform: "linux",
     fetch: registry("1.4.12"),
     spawn: spawn.spawn,
-  }));
+  });
   assert.equal(spawn.calls.length, 0);
   assert.equal(captured.exitCode, 0);
   assert.match(captured.out, /npx tokentracker-cli@1\.4\.12/);
@@ -491,10 +491,10 @@ test("npx prints the next launch command and does not install", async () => {
 
 test("a registry failure prints the three CLI install commands and does not install", async () => {
   const spawn = fakeSpawn();
-  const captured = await capture(() => cmdUpdate([], npmDeps({
+  const captured = await runUpdate([], npmDeps({
     fetch: registry("1.4.12; rm -rf /", 200),
     spawn: spawn.spawn,
-  })));
+  }));
   assert.equal(spawn.probes.length + spawn.calls.length, 0);
   assert.equal(captured.exitCode, 1);
   assert.match(captured.out, /npm install -g tokentracker-cli@latest/);
@@ -503,19 +503,28 @@ test("a registry failure prints the three CLI install commands and does not inst
   assert.equal(captured.out.includes("rm -rf"), false);
 });
 
-test("unknown commands print help to stderr instead of throwing", async () => {
-  const captured = await capture(() => run(["updat"]));
-  assert.equal(captured.out, "");
-  assert.match(captured.err, /Unknown command: updat/);
-  assert.match(captured.err, /Usage:/);
-  assert.match(captured.err, /update \[--check\] \[--json\]/);
-  assert.match(captured.err, /doctor/);
-  assert.equal(captured.err.includes("at run ("), false);
-  assert.equal(captured.exitCode, 1);
+test("unknown commands print help to stderr instead of throwing", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-update-cli-"));
+  try {
+    const result = spawnSync(process.execPath, [path.join(__dirname, "../bin/tracker.js"), "updat"], {
+      encoding: "utf8",
+      timeout: 30_000,
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /Unknown command: updat/);
+    assert.match(result.stderr, /Usage:/);
+    assert.match(result.stderr, /npx tokentracker-cli \[--debug\] update \[--check\] \[--json\]/);
+    assert.match(result.stderr, /doctor/);
+    assert.equal(result.stderr.includes("    at "), false);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("update reports an unknown option with usage instead of a stack", async () => {
-  const captured = await capture(() => cmdUpdate(["--force"]));
+  const captured = await runUpdate(["--force"]);
   assert.equal(captured.out, "");
   assert.match(captured.err, /Unknown option: --force/);
   assert.match(captured.err, /Usage: tokentracker update \[--check\] \[--json\]/);
