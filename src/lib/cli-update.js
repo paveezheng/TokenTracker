@@ -56,7 +56,9 @@ function nativePath(posixValue, platform) {
 // Documented CLI installs are npm global, Homebrew, and a one-shot npx run.
 // npm's global layout is prefix/lib/node_modules on Unix and
 // prefix/node_modules under the npm or nodejs directory on Windows.
-// A project-local node_modules, or a pnpm/yarn/bun/Volta tree, does not match.
+// pnpm/yarn/bun global trees do not match. The layout alone is only a
+// candidate: a project directory named lib, Volta's package images, and mise
+// installs share it, so planUpdate also requires npm's own global prefix.
 function npmGlobalPrefix(posixRoot, platform) {
   const marker = `/node_modules/${NPM_PACKAGE}`;
   if (!posixRoot.endsWith(marker)) return null;
@@ -71,9 +73,19 @@ function npmGlobalPrefix(posixRoot, platform) {
   return null;
 }
 
+// Windows and the default macOS volume compare paths case-insensitively.
+function samePath(left, right, platform) {
+  const a = toPosix(left);
+  const b = toPosix(right);
+  if (!a || !b) return false;
+  if (platform === "win32" || platform === "darwin") return a.toLowerCase() === b.toLowerCase();
+  return a === b;
+}
+
+// The cask installs TokenTracker.app into /Applications, so its bundled CLI
+// is classified as "app"; only the formula lives under the Cellar.
 function classifyInstall({ packageRoot, platform = "linux" } = {}) {
   const root = toPosix(packageRoot);
-  if (root.includes("/Caskroom/tokentracker/")) return { channel: "brew-cask", prefix: null };
   if (root.includes("/Cellar/tokentracker/")) return { channel: "brew", prefix: null };
   if (root.includes("/_npx/")) return { channel: "npx", prefix: null };
   const prefix = npmGlobalPrefix(root, platform);
@@ -106,16 +118,46 @@ function appUpdateLines() {
   ];
 }
 
-function brewCommand(channel) {
-  if (channel === "brew-cask") return ["brew", "upgrade", "--cask", BREW_FORMULA];
-  return ["brew", "upgrade", BREW_FORMULA];
+// Cellar/tokentracker/<version>/... is replaced by the upgrade; opt/tokentracker
+// is the link Homebrew moves to the keg it installed.
+function brewLinkedPackageRoot(packageRoot) {
+  const root = toPosix(packageRoot);
+  const marker = "/Cellar/tokentracker/";
+  const at = root.indexOf(marker);
+  if (at < 0) return null;
+  const rest = root.indexOf("/", at + marker.length);
+  if (rest < 0) return null;
+  return `${root.slice(0, at)}/opt/tokentracker${root.slice(rest)}`;
 }
 
-function npmCommand(prefix, version, platform) {
+// The command a user would type. cmdUpdate runs it through the Node runtime's
+// npm-cli.js (see npmCliCandidates) rather than a PATH lookup.
+function npmCommand(prefix, version) {
   const parsed = parseVersion(version);
   if (!prefix || !parsed) return null;
-  const npmBin = platform === "win32" ? "npm.cmd" : "npm";
-  return [npmBin, "install", "--global", "--prefix", prefix, `${NPM_PACKAGE}@${parsed.raw}`];
+  return ["npm", "install", "--global", "--prefix", prefix, `${NPM_PACKAGE}@${parsed.raw}`];
+}
+
+// Where the running Node keeps npm, then where npm lives under the install
+// prefix. On Unix, bin/npm links to npm-cli.js in the official, nvm and
+// Homebrew layouts (Homebrew keeps the package outside the node keg). On
+// Windows the PATH entry is npm.cmd, which only runs under cmd.exe, and
+// cmd.exe resolves a bare name from the current directory before PATH.
+// Running npm-cli.js with node needs no shell and no lookup.
+function npmCliCandidates({ prefix, platform = "linux", execPath }) {
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
+  const tail = ["node_modules", "npm", "bin", "npm-cli.js"];
+  if (platform === "win32") {
+    return [...new Set([execPath && pathApi.dirname(execPath), prefix]
+      .filter(Boolean)
+      .map((root) => pathApi.join(root, ...tail)))];
+  }
+  const bin = execPath ? pathApi.dirname(execPath) : null;
+  return [...new Set([
+    bin && pathApi.join(bin, "npm"),
+    bin && pathApi.join(pathApi.dirname(bin), "lib", ...tail),
+    prefix && pathApi.join(prefix, "lib", ...tail),
+  ].filter(Boolean))];
 }
 
 function versionLine(current, latest, label) {
@@ -127,7 +169,19 @@ function versionLine(current, latest, label) {
   return `TokenTracker ${current} → ${latest} (${label})`;
 }
 
-function planUpdate({ packageRoot, platform = "linux", current, latest = null, writable = true } = {}) {
+// npmPrefix is npm's own global prefix (`npm prefix --global`), and npm is the
+// argv that runs npm (node plus npm-cli.js); either is null when cmdUpdate
+// could not find it. command is what the user would type; exec is what
+// cmdUpdate spawns when apply is true.
+function planUpdate({
+  packageRoot,
+  platform = "linux",
+  current,
+  latest = null,
+  writable = true,
+  npmPrefix = null,
+  npm = null,
+} = {}) {
   const install = classifyInstall({ packageRoot, platform });
   const parsedLatest = parseVersion(latest);
   const latestRaw = parsedLatest ? parsedLatest.raw : null;
@@ -135,29 +189,39 @@ function planUpdate({ packageRoot, platform = "linux", current, latest = null, w
   const updateAvailable = Boolean(latestRaw && (cmp === null || cmp < 0));
   const lines = [];
   let command = null;
+  let exec = null;
   let apply = false;
 
   if (install.channel === "npm") {
     lines.push(versionLine(current, latestRaw, "npm"));
-    if (updateAvailable) {
-      command = npmCommand(install.prefix, latestRaw, platform);
-      if (writable && command) {
-        apply = true;
-        lines.push(formatCommand(command));
-      } else {
+    if (updateAvailable && !npm) {
+      command = npmCommand(install.prefix, latestRaw);
+      lines.push("Could not find npm next to this Node runtime. If this is your npm global install, run:");
+      lines.push(formatCommand(command));
+    } else if (updateAvailable && !samePath(install.prefix, npmPrefix, platform)) {
+      lines.push(npmPrefix
+        ? `This copy is in ${install.prefix}, but npm's global prefix is ${npmPrefix}.`
+        : `Could not confirm that ${install.prefix} is npm's global prefix.`);
+      lines.push("It may be a project dependency or managed by another tool such as Volta or mise. Update it the way it was installed.");
+    } else if (updateAvailable) {
+      command = npmCommand(install.prefix, latestRaw);
+      if (!writable) {
         lines.push(`The npm prefix is not writable: ${install.prefix}`);
         lines.push("Run this as a user who can write there:");
-        if (command) lines.push(formatCommand(command));
+        lines.push(formatCommand(command));
+      } else {
+        apply = true;
+        exec = [...npm, ...command.slice(1)];
+        lines.push(formatCommand(command));
       }
     }
-  } else if (install.channel === "brew" || install.channel === "brew-cask") {
-    const label = install.channel === "brew-cask" ? "Homebrew cask" : "Homebrew";
-    lines.push(versionLine(current, latestRaw, label));
+  } else if (install.channel === "brew") {
+    lines.push(versionLine(current, latestRaw, "Homebrew"));
     if (updateAvailable) {
-      command = brewCommand(install.channel);
+      command = ["brew", "upgrade", BREW_FORMULA];
+      exec = command;
       apply = true;
       lines.push(formatCommand(command));
-      lines.push("Homebrew's tap follows a release within about an hour. Until it bumps, brew reports the formula is already up to date.");
     }
   } else if (install.channel === "npx") {
     if (updateAvailable) {
@@ -201,6 +265,7 @@ function planUpdate({ packageRoot, platform = "linux", current, latest = null, w
     updateAvailable,
     apply,
     command,
+    exec,
     lines,
   };
 }
@@ -230,6 +295,8 @@ module.exports = {
   parseVersion,
   compareVersions,
   classifyInstall,
+  brewLinkedPackageRoot,
+  npmCliCandidates,
   officialCommands,
   planUpdate,
   fetchLatestNpmVersion,

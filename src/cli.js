@@ -75,16 +75,16 @@ async function run(argv) {
       await cmdUpdate(rest);
       return;
     default:
-      process.stdout.write(`Unknown command: ${command}\n\n`);
-      printHelp();
+      process.stderr.write(`Unknown command: ${command}\n\n`);
+      printHelp(process.stderr);
       process.exitCode = 1;
       return;
   }
 }
 
-function printHelp() {
+function printHelp(stream = process.stdout) {
   // Keep this short; npx users want quick guidance.
-  process.stdout.write(
+  stream.write(
     [
       "tokentracker",
       "",
@@ -118,6 +118,7 @@ function printHelp() {
       "  - device-login pairs a headless CLI / SSH session with a browser sign-in (15-min code).",
       "  - sessions exports metadata-only Claude/Codex/Grok/ZCode efficiency analytics; no prompt or response text is retained.",
       "  - update upgrades an npm global install or a Homebrew install. An npx run prints the command for the next launch.",
+      "  - update --check only reports, and exits 1 when a newer release exists. --json prints one JSON object.",
       "",
     ].join("\n"),
   );
