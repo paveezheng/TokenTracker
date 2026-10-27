@@ -1,7 +1,4 @@
 const assert = require("node:assert/strict");
-const fs = require("node:fs/promises");
-const os = require("node:os");
-const path = require("node:path");
 const { EventEmitter } = require("node:events");
 const { test } = require("node:test");
 
@@ -16,10 +13,13 @@ const {
 
 const NODE = "/usr/bin/node";
 const NPM_CLI = "/usr/lib/node_modules/npm/bin/npm-cli.js";
+const NPM_ROOT = "/usr/lib/node_modules/tokentracker-cli";
 const WIN_NODE = "C:\\Program Files\\nodejs\\node.exe";
 const WIN_NPM_CLI = "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js";
 const WIN_PREFIX = "C:\\Users\\me\\AppData\\Roaming\\npm";
 const WIN_ROOT = `${WIN_PREFIX}\\node_modules\\tokentracker-cli`;
+const BREW_ROOT = "/opt/homebrew/Cellar/tokentracker/1.4.7/libexec/lib/node_modules/tokentracker-cli";
+const BREW_LINKED = "/opt/homebrew/opt/tokentracker/libexec/lib/node_modules/tokentracker-cli";
 
 function capture(fn) {
   const prevOut = process.stdout.write;
@@ -80,6 +80,28 @@ function fakeSpawn({ code = 0, npmPrefix = null, onSpawn } = {}) {
   return { spawn, calls, probes };
 }
 
+// Paths compare with forward slashes, so the same fixtures hold on the
+// Windows CI runner, where path.join() rewrites them with backslashes.
+// versions maps a package root to its package.json version and can be
+// changed while a test runs; links maps a path to its realpath.
+function fakeFs({ versions = {}, files = [], links = {} } = {}) {
+  const norm = (value) => String(value).replace(/\\/g, "/");
+  const exists = new Set([...files, ...Object.keys(links)].map(norm));
+  return {
+    versions,
+    existsSync: (file) => exists.has(norm(file)),
+    realpathSync: (file) => {
+      const key = Object.keys(links).find((link) => norm(link) === norm(file));
+      return key ? links[key] : file;
+    },
+    readFileSync: (file) => {
+      const root = Object.keys(versions).find((dir) => `${norm(dir)}/package.json` === norm(file));
+      if (!root) throw Object.assign(new Error(`ENOENT: ${file}`), { code: "ENOENT" });
+      return JSON.stringify({ name: "tokentracker-cli", version: versions[root] });
+    },
+  };
+}
+
 function plan(packageRoot, extra = {}) {
   return planUpdate({
     packageRoot,
@@ -92,12 +114,16 @@ function plan(packageRoot, extra = {}) {
   });
 }
 
-async function writeManifest(packageRoot, version) {
-  await fs.mkdir(packageRoot, { recursive: true });
-  await fs.writeFile(
-    path.join(packageRoot, "package.json"),
-    JSON.stringify({ name: "tokentracker-cli", version }),
-  );
+function npmDeps(extra = {}) {
+  return {
+    packageRoot: NPM_ROOT,
+    execPath: NODE,
+    currentVersion: "1.4.7",
+    platform: "linux",
+    writable: true,
+    fetch: registry("1.4.12"),
+    ...extra,
+  };
 }
 
 test("compareVersions orders releases and prereleases", () => {
@@ -110,7 +136,7 @@ test("compareVersions orders releases and prereleases", () => {
 });
 
 test("npm global, Homebrew, and npx are the CLI update channels", () => {
-  const npmPlan = plan("/usr/lib/node_modules/tokentracker-cli", { npmPrefix: "/usr" });
+  const npmPlan = plan(NPM_ROOT, { npmPrefix: "/usr" });
   assert.equal(npmPlan.channel, "npm");
   assert.equal(npmPlan.prefix, "/usr");
   assert.equal(npmPlan.apply, true);
@@ -129,7 +155,7 @@ test("npm global, Homebrew, and npx are the CLI update channels", () => {
   assert.equal(nvmPlan.prefix, nvmPrefix);
   assert.equal(nvmPlan.apply, true);
 
-  const brewPlan = plan("/opt/homebrew/Cellar/tokentracker/1.4.7/libexec/lib/node_modules/tokentracker-cli");
+  const brewPlan = plan(BREW_ROOT);
   assert.equal(brewPlan.channel, "brew");
   assert.deepEqual(brewPlan.command, ["brew", "upgrade", "xiufengsun/tokentracker/tokentracker"]);
   assert.deepEqual(brewPlan.exec, brewPlan.command);
@@ -229,7 +255,7 @@ test("a bundled app, including the Homebrew cask's, is not updated with npm", ()
 });
 
 test("an npm install that is already current does not run", () => {
-  const result = plan("/usr/lib/node_modules/tokentracker-cli", { current: "1.4.12", latest: "1.4.12" });
+  const result = plan(NPM_ROOT, { current: "1.4.12", latest: "1.4.12" });
   assert.equal(result.updateAvailable, false);
   assert.equal(result.apply, false);
   assert.match(result.lines.join("\n"), /already the latest release/);
@@ -245,14 +271,10 @@ test("fetchLatestNpmVersion rejects a version that is not a release number", asy
 
 test("update --check reports a newer npm release without installing", async () => {
   const spawn = fakeSpawn({ npmPrefix: "/usr" });
-  const captured = await capture(() => cmdUpdate(["--check", "--json"], {
-    packageRoot: "/usr/lib/node_modules/tokentracker-cli",
-    currentVersion: "1.4.7",
-    platform: "linux",
-    writable: true,
-    fetch: registry("1.4.12"),
+  const captured = await capture(() => cmdUpdate(["--check", "--json"], npmDeps({
+    fs: fakeFs({ files: [NPM_CLI] }),
     spawn: spawn.spawn,
-  }));
+  })));
   const payload = JSON.parse(captured.out);
   assert.equal(payload.ok, true);
   assert.equal(payload.updateAvailable, true);
@@ -260,85 +282,74 @@ test("update --check reports a newer npm release without installing", async () =
   assert.equal(payload.channel, "npm");
   assert.equal(payload.command[5], "tokentracker-cli@1.4.12");
   assert.equal(captured.exitCode, 1);
+  assert.equal(spawn.probes.length, 1);
   assert.equal(spawn.calls.length, 0);
 });
 
 test("update installs the npm global prefix in place", async () => {
-  // packageRoot is a realpath in production (defaultPackageRoot).
-  const tmp = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-update-")));
-  const packageRoot = path.join(tmp, "lib", "node_modules", "tokentracker-cli");
-  const execPath = path.join(tmp, "bin", "node");
-  const npmCli = path.join(tmp, "lib", "node_modules", "npm", "bin", "npm-cli.js");
-  await writeManifest(packageRoot, "1.4.7");
-  await fs.mkdir(path.dirname(npmCli), { recursive: true });
-  await fs.writeFile(npmCli, "");
-  const realNpmCli = await fs.realpath(npmCli);
+  const fs = fakeFs({ files: [NPM_CLI], versions: { [NPM_ROOT]: "1.4.7" } });
   const spawn = fakeSpawn({
-    npmPrefix: tmp,
+    npmPrefix: "/usr",
     onSpawn() {
       process.stdout.write("installer output\n");
-      require("node:fs").writeFileSync(
-        path.join(packageRoot, "package.json"),
-        JSON.stringify({ name: "tokentracker-cli", version: "1.4.12" }),
-      );
+      fs.versions[NPM_ROOT] = "1.4.12";
     },
   });
+  const captured = await capture(() => cmdUpdate([], npmDeps({ fs, spawn: spawn.spawn })));
+  assert.equal(captured.exitCode, 0);
+  assert.equal(spawn.probes[0].command, NODE);
+  assert.deepEqual(spawn.probes[0].args, [NPM_CLI, "prefix", "--global"]);
+  assert.equal(spawn.calls.length, 1);
+  assert.equal(spawn.calls[0].command, NODE);
+  assert.deepEqual(spawn.calls[0].args, [
+    NPM_CLI,
+    "install",
+    "--global",
+    "--prefix",
+    "/usr",
+    "tokentracker-cli@1.4.12",
+  ]);
+  assert.equal(spawn.calls[0].options.shell, false);
+  // The planned command prints before the installer runs, the result after.
+  const planned = "npm install --global --prefix /usr tokentracker-cli@1.4.12";
+  const plannedAt = captured.out.indexOf(planned);
+  const installerAt = captured.out.indexOf("installer output");
+  const resultAt = captured.out.indexOf("Updated to 1.4.12");
+  assert.ok(plannedAt >= 0 && plannedAt < installerAt && installerAt < resultAt, captured.out);
+  assert.equal(captured.out.split(planned).length, 2);
+});
 
-  try {
-    const captured = await capture(() => cmdUpdate([], {
-      packageRoot,
-      execPath,
-      currentVersion: "1.4.7",
-      platform: "linux",
-      fetch: registry("1.4.12"),
-      spawn: spawn.spawn,
-    }));
-    assert.equal(captured.exitCode, 0);
-    assert.deepEqual(spawn.probes[0].args, [realNpmCli, "prefix", "--global"]);
-    assert.equal(spawn.calls.length, 1);
-    assert.equal(spawn.calls[0].command, execPath);
-    assert.deepEqual(spawn.calls[0].args, [
-      realNpmCli,
-      "install",
-      "--global",
-      "--prefix",
-      tmp,
-      "tokentracker-cli@1.4.12",
-    ]);
-    assert.equal(spawn.calls[0].options.shell, false);
-    // The planned command prints before the installer runs, the result after.
-    const commandAt = captured.out.indexOf(`npm install --global --prefix ${tmp}`);
-    const installerAt = captured.out.indexOf("installer output");
-    const resultAt = captured.out.indexOf("Updated to 1.4.12");
-    assert.ok(commandAt >= 0 && commandAt < installerAt && installerAt < resultAt, captured.out);
-    assert.equal(captured.out.split(`npm install --global --prefix ${tmp}`).length, 2);
-  } finally {
-    await fs.rm(tmp, { recursive: true, force: true });
-  }
+test("update follows bin/npm to npm-cli.js and skips a bin/npm that is a shell wrapper", async () => {
+  const linked = fakeSpawn({ npmPrefix: "/usr" });
+  await capture(() => cmdUpdate(["--check"], npmDeps({
+    fs: fakeFs({ links: { "/usr/bin/npm": "/opt/npm/bin/npm-cli.js" } }),
+    spawn: linked.spawn,
+  })));
+  assert.equal(linked.probes[0].args[0], "/opt/npm/bin/npm-cli.js");
+
+  const wrapped = fakeSpawn({ npmPrefix: "/usr" });
+  await capture(() => cmdUpdate(["--check"], npmDeps({
+    fs: fakeFs({ links: { "/usr/bin/npm": "/usr/share/npm/npm.sh" }, files: [NPM_CLI] }),
+    spawn: wrapped.spawn,
+  })));
+  assert.equal(wrapped.probes[0].args[0], NPM_CLI);
 });
 
 test("update on Windows spawns node and npm-cli.js without a shell", async () => {
-  let version = "1.4.7";
-  const fakeFs = {
-    existsSync: (file) => file === WIN_NPM_CLI,
-    readFileSync: () => JSON.stringify({ version }),
-  };
+  const fs = fakeFs({ files: [WIN_NPM_CLI], versions: { [WIN_ROOT]: "1.4.7" } });
   const spawn = fakeSpawn({
     npmPrefix: WIN_PREFIX,
     onSpawn() {
-      version = "1.4.12";
+      fs.versions[WIN_ROOT] = "1.4.12";
     },
   });
-  const captured = await capture(() => cmdUpdate([], {
+  const captured = await capture(() => cmdUpdate([], npmDeps({
     packageRoot: WIN_ROOT,
     execPath: WIN_NODE,
-    currentVersion: "1.4.7",
     platform: "win32",
-    writable: true,
-    fs: fakeFs,
-    fetch: registry("1.4.12"),
+    fs,
     spawn: spawn.spawn,
-  }));
+  })));
   assert.equal(captured.exitCode, 0);
   assert.equal(spawn.probes[0].command, WIN_NODE);
   assert.deepEqual(spawn.probes[0].args, [WIN_NPM_CLI, "prefix", "--global"]);
@@ -348,20 +359,18 @@ test("update on Windows spawns node and npm-cli.js without a shell", async () =>
     assert.equal(call.options.shell, false);
     assert.equal(/npm\.cmd$/i.test(call.command), false);
   }
+  assert.match(captured.out, /Updated to 1\.4\.12/);
 });
 
 test("update on Windows without a bundled npm prints the command instead of running npm.cmd", async () => {
   const spawn = fakeSpawn({ npmPrefix: WIN_PREFIX });
-  const captured = await capture(() => cmdUpdate([], {
+  const captured = await capture(() => cmdUpdate([], npmDeps({
     packageRoot: WIN_ROOT,
     execPath: WIN_NODE,
-    currentVersion: "1.4.7",
     platform: "win32",
-    writable: true,
-    fs: { existsSync: () => false },
-    fetch: registry("1.4.12"),
+    fs: fakeFs(),
     spawn: spawn.spawn,
-  }));
+  })));
   assert.equal(spawn.probes.length + spawn.calls.length, 0);
   assert.equal(captured.exitCode, 1);
   assert.match(captured.out, /Could not find npm/);
@@ -370,115 +379,89 @@ test("update on Windows without a bundled npm prints the command instead of runn
 
 test("update refuses a lib/node_modules copy outside npm's global prefix", async () => {
   const spawn = fakeSpawn({ npmPrefix: "/usr/local" });
-  const captured = await capture(() => cmdUpdate([], {
+  const captured = await capture(() => cmdUpdate([], npmDeps({
     packageRoot: "/home/me/.volta/tools/image/packages/tokentracker-cli/lib/node_modules/tokentracker-cli",
-    currentVersion: "1.4.7",
-    platform: "linux",
-    writable: true,
-    fetch: registry("1.4.12"),
+    fs: fakeFs({ files: [NPM_CLI] }),
     spawn: spawn.spawn,
-  }));
+  })));
   assert.equal(spawn.probes.length, 1);
   assert.equal(spawn.calls.length, 0);
   assert.equal(captured.exitCode, 1);
   assert.match(captured.out, /npm's global prefix is \/usr\/local/);
 });
 
+test("update compares npm's prefix after resolving its symlinks", async () => {
+  const spawn = fakeSpawn({ npmPrefix: "/home/me/npm-global" });
+  const captured = await capture(() => cmdUpdate(["--check", "--json"], npmDeps({
+    packageRoot: "/data/npm-global/lib/node_modules/tokentracker-cli",
+    fs: fakeFs({ files: [NPM_CLI], links: { "/home/me/npm-global": "/data/npm-global" } }),
+    spawn: spawn.spawn,
+  })));
+  assert.match(JSON.parse(captured.out).message, /npm install --global --prefix \/data\/npm-global/);
+});
+
 test("update does not claim success when the npm install leaves the old version", async () => {
-  // packageRoot is a realpath in production (defaultPackageRoot).
-  const tmp = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-update-")));
-  const packageRoot = path.join(tmp, "lib", "node_modules", "tokentracker-cli");
-  await writeManifest(packageRoot, "1.4.7");
-  const spawn = fakeSpawn({ npmPrefix: tmp });
-  try {
-    const captured = await capture(() => cmdUpdate([], {
-      packageRoot,
-      currentVersion: "1.4.7",
-      platform: "linux",
-      fetch: registry("1.4.12"),
-      spawn: spawn.spawn,
-    }));
-    assert.equal(captured.exitCode, 1);
-    assert.match(captured.out, /still 1\.4\.7/);
-  } finally {
-    await fs.rm(tmp, { recursive: true, force: true });
-  }
+  const spawn = fakeSpawn({ npmPrefix: "/usr" });
+  const captured = await capture(() => cmdUpdate([], npmDeps({
+    fs: fakeFs({ files: [NPM_CLI], versions: { [NPM_ROOT]: "1.4.7" } }),
+    spawn: spawn.spawn,
+  })));
+  assert.equal(spawn.calls.length, 1);
+  assert.equal(captured.exitCode, 1);
+  assert.match(captured.out, /still 1\.4\.7/);
 });
 
 test("update refuses an unwritable npm prefix", async () => {
   const spawn = fakeSpawn({ npmPrefix: "/usr" });
-  const captured = await capture(() => cmdUpdate([], {
-    packageRoot: "/usr/lib/node_modules/tokentracker-cli",
-    currentVersion: "1.4.7",
-    platform: "linux",
+  const captured = await capture(() => cmdUpdate([], npmDeps({
     writable: false,
-    fetch: registry("1.4.12"),
+    fs: fakeFs({ files: [NPM_CLI] }),
     spawn: spawn.spawn,
-  }));
+  })));
   assert.equal(spawn.calls.length, 0);
   assert.equal(captured.exitCode, 1);
   assert.match(captured.out, /not writable: \/usr/);
   assert.match(captured.out, /npm install --global --prefix \/usr tokentracker-cli@1\.4\.12/);
 });
 
-async function brewFixture() {
-  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-brew-"));
-  const inner = path.join("libexec", "lib", "node_modules", "tokentracker-cli");
-  const packageRoot = path.join(tmp, "Cellar", "tokentracker", "1.4.7", inner);
-  const linkedRoot = path.join(tmp, "opt", "tokentracker", inner);
-  await writeManifest(packageRoot, "1.4.7");
-  await writeManifest(linkedRoot, "1.4.7");
-  return { tmp, packageRoot, linkedRoot };
-}
-
 test("update runs brew upgrade and confirms the version Homebrew linked", async () => {
-  const { tmp, packageRoot, linkedRoot } = await brewFixture();
+  const fs = fakeFs({ versions: { [BREW_LINKED]: "1.4.7" } });
   const spawn = fakeSpawn({
     onSpawn() {
-      require("node:fs").writeFileSync(
-        path.join(linkedRoot, "package.json"),
-        JSON.stringify({ name: "tokentracker-cli", version: "1.4.12" }),
-      );
+      fs.versions[BREW_LINKED] = "1.4.12";
     },
   });
-  try {
-    const captured = await capture(() => cmdUpdate([], {
-      packageRoot,
-      currentVersion: "1.4.7",
-      platform: "darwin",
-      fetch: registry("1.4.12"),
-      spawn: spawn.spawn,
-    }));
-    assert.equal(captured.exitCode, 0);
-    assert.equal(spawn.calls[0].command, "brew");
-    assert.deepEqual(spawn.calls[0].args, ["upgrade", "xiufengsun/tokentracker/tokentracker"]);
-    assert.equal(spawn.calls[0].options.shell, false);
-    assert.match(captured.out, /Updated to 1\.4\.12/);
-  } finally {
-    await fs.rm(tmp, { recursive: true, force: true });
-  }
+  const captured = await capture(() => cmdUpdate([], {
+    packageRoot: BREW_ROOT,
+    currentVersion: "1.4.7",
+    platform: "darwin",
+    fs,
+    fetch: registry("1.4.12"),
+    spawn: spawn.spawn,
+  }));
+  assert.equal(captured.exitCode, 0);
+  assert.equal(spawn.calls[0].command, "brew");
+  assert.deepEqual(spawn.calls[0].args, ["upgrade", "xiufengsun/tokentracker/tokentracker"]);
+  assert.equal(spawn.calls[0].options.shell, false);
+  assert.match(captured.out, /Updated to 1\.4\.12/);
 });
 
 test("update does not report applied when the Homebrew tap has not bumped yet", async () => {
-  const { tmp, packageRoot } = await brewFixture();
   const spawn = fakeSpawn();
-  try {
-    const captured = await capture(() => cmdUpdate(["--json"], {
-      packageRoot,
-      currentVersion: "1.4.7",
-      platform: "darwin",
-      fetch: registry("1.4.12"),
-      spawn: spawn.spawn,
-    }));
-    const payload = JSON.parse(captured.out);
-    assert.equal(spawn.calls.length, 1);
-    assert.equal(captured.exitCode, 1);
-    assert.equal(payload.ok, false);
-    assert.equal(payload.applied, false);
-    assert.match(payload.message, /Homebrew still has 1\.4\.7/);
-  } finally {
-    await fs.rm(tmp, { recursive: true, force: true });
-  }
+  const captured = await capture(() => cmdUpdate(["--json"], {
+    packageRoot: BREW_ROOT,
+    currentVersion: "1.4.7",
+    platform: "darwin",
+    fs: fakeFs({ versions: { [BREW_LINKED]: "1.4.7" } }),
+    fetch: registry("1.4.12"),
+    spawn: spawn.spawn,
+  }));
+  const payload = JSON.parse(captured.out);
+  assert.equal(spawn.calls.length, 1);
+  assert.equal(captured.exitCode, 1);
+  assert.equal(payload.ok, false);
+  assert.equal(payload.applied, false);
+  assert.match(payload.message, /Homebrew still has 1\.4\.7/);
 });
 
 test("npx prints the next launch command and does not install", async () => {
@@ -497,13 +480,10 @@ test("npx prints the next launch command and does not install", async () => {
 
 test("a registry failure prints the three CLI install commands and does not install", async () => {
   const spawn = fakeSpawn();
-  const captured = await capture(() => cmdUpdate([], {
-    packageRoot: "/usr/lib/node_modules/tokentracker-cli",
-    currentVersion: "1.4.7",
-    platform: "linux",
+  const captured = await capture(() => cmdUpdate([], npmDeps({
     fetch: registry("1.4.12; rm -rf /", 200),
     spawn: spawn.spawn,
-  }));
+  })));
   assert.equal(spawn.probes.length + spawn.calls.length, 0);
   assert.equal(captured.exitCode, 1);
   assert.match(captured.out, /npm install -g tokentracker-cli@latest/);
