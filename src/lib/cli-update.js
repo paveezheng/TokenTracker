@@ -105,8 +105,19 @@ function officialCommands(version) {
   ];
 }
 
-function formatCommand(argv) {
-  return argv.map((arg) => (/[\s"]/.test(arg) ? `"${String(arg).replace(/"/g, '\\"')}"` : String(arg))).join(" ");
+// Display only: exec is spawned without a shell. Quote for the shell the user
+// pastes into. Nothing expands inside POSIX single quotes, so only a quote
+// itself needs splicing. A Windows path cannot contain a double quote.
+function quoteArg(arg, platform) {
+  const value = String(arg);
+  const plain = platform === "win32" ? /^[\w@%+=:,./\\-]+$/ : /^[\w@%+=:,./-]+$/;
+  if (plain.test(value)) return value;
+  if (platform === "win32") return `"${value}"`;
+  return `'${value.split("'").join("'\\''")}'`;
+}
+
+function formatCommand(argv, platform = "linux") {
+  return argv.map((arg) => quoteArg(arg, platform)).join(" ");
 }
 
 function appUpdateLines() {
@@ -197,7 +208,7 @@ function planUpdate({
     if (updateAvailable && !npm) {
       command = npmCommand(install.prefix, latestRaw);
       lines.push("Could not find npm next to this Node runtime. If this is your npm global install, run:");
-      lines.push(formatCommand(command));
+      lines.push(formatCommand(command, platform));
     } else if (updateAvailable && !samePath(install.prefix, npmPrefix, platform)) {
       lines.push(npmPrefix
         ? `This copy is in ${install.prefix}, but npm's global prefix is ${npmPrefix}.`
@@ -208,11 +219,11 @@ function planUpdate({
       if (!writable) {
         lines.push(`The npm prefix is not writable: ${install.prefix}`);
         lines.push("Run this as a user who can write there:");
-        lines.push(formatCommand(command));
+        lines.push(formatCommand(command, platform));
       } else {
         apply = true;
         exec = [...npm, ...command.slice(1)];
-        lines.push(formatCommand(command));
+        lines.push(formatCommand(command, platform));
       }
     }
   } else if (install.channel === "brew") {
@@ -221,7 +232,7 @@ function planUpdate({
       command = ["brew", "upgrade", BREW_FORMULA];
       exec = command;
       apply = true;
-      lines.push(formatCommand(command));
+      lines.push(formatCommand(command, platform));
     }
   } else if (install.channel === "npx") {
     if (updateAvailable) {

@@ -8,6 +8,7 @@ const {
   compareVersions,
   planUpdate,
   npmCliCandidates,
+  formatCommand,
   fetchLatestNpmVersion,
 } = require("../src/lib/cli-update");
 
@@ -194,6 +195,16 @@ test("npm-cli.js is looked up next to the running node, then under the prefix", 
     npmCliCandidates({ prefix: WIN_PREFIX, platform: "win32", execPath: WIN_NODE }),
     [WIN_NPM_CLI, `${WIN_PREFIX}\\node_modules\\npm\\bin\\npm-cli.js`],
   );
+});
+
+test("printed commands are quoted for the shell the user pastes into", () => {
+  assert.equal(formatCommand(["npm", "--prefix", "/usr", "tokentracker-cli@1.4.12"], "darwin"),
+    "npm --prefix /usr tokentracker-cli@1.4.12");
+  assert.equal(formatCommand(["npm", "--prefix", "/home/a b/$HOME/`id`/it's\\x"], "linux"),
+    "npm --prefix '/home/a b/$HOME/`id`/it'\\''s\\x'");
+  assert.equal(formatCommand(["npm", "--prefix", WIN_PREFIX], "win32"), `npm --prefix ${WIN_PREFIX}`);
+  assert.equal(formatCommand(["npm", "--prefix", "C:\\Users\\John Doe\\npm"], "win32"),
+    'npm --prefix "C:\\Users\\John Doe\\npm"');
 });
 
 test("a lib/node_modules copy outside npm's global prefix is not updated", () => {
