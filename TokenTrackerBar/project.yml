@@ -191,6 +191,7 @@ targets:
       - path: TokenTrackerBar/Utilities/DateHelpers.swift
       - path: TokenTrackerBar/Utilities/TokenFormatter.swift
       - path: TokenTrackerBar/Models/AutoUpdatePolicy.swift
+      - path: TokenTrackerBar/Models/WidgetExtensionRegistrationPolicy.swift
       # WeeklyLimitResetDetector's window labels come from Strings, which
       # resolves the locale via Shared/NativeLocalization (Shared is
       # Foundation-only by design, so pulling the whole dir stays cheap).

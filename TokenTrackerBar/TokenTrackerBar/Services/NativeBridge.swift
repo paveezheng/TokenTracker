@@ -570,8 +570,9 @@ final class NativeBridge {
             // directly — neither NSWorkspace URL schemes nor AppKit expose
             // the widget picker. The most honest + reliable response is a
             // native alert that explains the two-step flow (right-click
-            // desktop → Edit Widgets → search TokenTracker).
-            DispatchQueue.main.async {
+            // desktop → Edit Widgets → search TokenTracker). Repair a dropped
+            // extension registration first so that search actually finds it.
+            WidgetExtensionRegistrar.ensureRegistered {
                 let alert = NSAlert()
                 alert.messageText = Strings.addWidgetsTitle
                 alert.informativeText = Strings.addWidgetsMessage

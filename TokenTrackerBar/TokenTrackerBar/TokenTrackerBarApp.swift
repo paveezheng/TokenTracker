@@ -158,6 +158,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         registerWakeCatchUpObservers()
 
+        // Ad-hoc builds can lose their widget registration (e.g. on a macOS
+        // update); put it back so the widget gallery keeps listing TokenTracker.
+        WidgetExtensionRegistrar.ensureRegistered()
+
         // A normal Finder/Dock launch should behave like opening an app, while
         // an SMAppService login launch should remain a quiet menu bar startup.
         if NSAppleEventManager.shared().currentAppleEvent?
