@@ -4,7 +4,8 @@ import os
 
 /// Bridge between the live `DashboardViewModel` and the on-disk widget
 /// snapshot file. Called from `DashboardViewModel.loadAll()` after every
-/// successful refresh, and again after a manual sync.
+/// successful refresh, and again after a manual sync. A limits preference
+/// change re-renders the last snapshot via `refreshForPreferenceChange()`.
 ///
 /// Behavior:
 ///   1. Translates view model state into a `WidgetSnapshot`
@@ -90,13 +91,20 @@ enum WidgetSnapshotWriter {
         // Superseded while awaiting the range fetches — drop this stale write.
         guard ticket == updateGeneration else { return }
 
-        let snapshot = buildSnapshot(
-            from: inputs,
-            last7dSummary: summary7d,
-            last30dSummary: summary30d,
-            last7dRange: last7dRange,
-            last30dRange: last30dRange
-        )
+        // Keep the inputs so a limits preference change can re-render this
+        // snapshot without waiting for the next data refresh.
+        let rebuild: @MainActor () -> WidgetSnapshot = {
+            buildSnapshot(
+                from: inputs,
+                last7dSummary: summary7d,
+                last30dSummary: summary30d,
+                last7dRange: last7dRange,
+                last30dRange: last30dRange
+            )
+        }
+        rebuildLastSnapshot = rebuild
+        let snapshot = rebuild()
+        lastSnapshot = snapshot
         // Write off the main actor on a serial queue (no main-thread file IO,
         // no torn concurrent writes); the generation guard above is what
         // keeps stale snapshots from overwriting newer ones.
@@ -105,6 +113,27 @@ enum WidgetSnapshotWriter {
                 continuation.resume(returning: WidgetSnapshotStore.write(snapshot))
             }
         }
+        finishWrite(ok)
+    }
+
+    /// Re-renders the last snapshot after a limits preference change
+    /// (Used/Remaining, hidden providers) so the widget follows the menu bar
+    /// right away. No-op until the first refresh, or when nothing the widget
+    /// shows has changed.
+    static func refreshForPreferenceChange() {
+        guard let rebuildLastSnapshot else { return }
+        let snapshot = rebuildLastSnapshot()
+        guard snapshot != lastSnapshot else { return }
+        lastSnapshot = snapshot
+        // Enqueued synchronously, so a refresh that started later still
+        // lands after this older-data write on the serial queue.
+        writeQueue.async {
+            let ok = WidgetSnapshotStore.write(snapshot)
+            Task { @MainActor in finishWrite(ok) }
+        }
+    }
+
+    private static func finishWrite(_ ok: Bool) {
         if ok {
             WidgetCenter.shared.reloadAllTimelines()
             logger.debug("Widget snapshot written and timelines reloaded")
@@ -118,6 +147,13 @@ enum WidgetSnapshotWriter {
 
     /// Bumped at the start of every `update`; stale calls bail before writing.
     private static var updateGeneration = 0
+
+    /// Rebuilds the most recent snapshot from its captured inputs with the
+    /// current limits preferences.
+    private static var rebuildLastSnapshot: (@MainActor () -> WidgetSnapshot)?
+
+    /// Last snapshot handed to the write queue.
+    private static var lastSnapshot: WidgetSnapshot?
 
     /// Fetches all totals for an explicit captured range. Returns nil on any
     /// failure so the widget can fall back to matching dashboard rolling fields.
@@ -171,8 +207,16 @@ enum WidgetSnapshotWriter {
             topModels: topModelEntries(from: inputs.topModels),
             sources: sourceEntries(from: inputs.fleetData),
             heatmap: heatmapPayload(from: inputs.heatmap),
-            limits: limitProviders(from: inputs.usageLimits)
+            limits: limitProviders(from: inputs.usageLimits),
+            limitDisplayMode: widgetLimitDisplayMode
         )
+    }
+
+    private static var widgetLimitDisplayMode: WidgetLimitDisplayMode {
+        switch LimitsSettingsStore.shared.displayMode {
+        case .used: return .used
+        case .remaining: return .remaining
+        }
     }
 
     // MARK: - Helpers

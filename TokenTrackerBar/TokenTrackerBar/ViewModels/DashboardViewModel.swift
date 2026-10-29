@@ -120,6 +120,12 @@ class DashboardViewModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.handleDevinSelectionChanged() }
             .store(in: &cancellables)
+        // The widget snapshot bakes in Used/Remaining and hidden providers;
+        // re-render it now instead of on the next data refresh.
+        NotificationCenter.default.publisher(for: .nativeSettingsChanged)
+            .receive(on: RunLoop.main)
+            .sink { _ in WidgetSnapshotWriter.refreshForPreferenceChange() }
+            .store(in: &cancellables)
     }
 
     // MARK: - Computed Properties

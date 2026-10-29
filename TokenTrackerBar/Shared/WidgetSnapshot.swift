@@ -64,6 +64,12 @@ public struct WidgetSnapshot: Codable, Equatable {
     /// Per-provider rate-limit windows.
     public var limits: [LimitProvider]
 
+    /// The app's Used/Remaining setting for `limits`. The sandboxed widget
+    /// cannot read the host's UserDefaults, so the host bakes it in here.
+    /// Optional so snapshots written before this field existed still decode;
+    /// nil reads as used.
+    public var limitDisplayMode: WidgetLimitDisplayMode?
+
     public init(
         schemaVersion: Int = WidgetSharedConstants.snapshotSchemaVersion,
         generatedAt: Date = Date(),
@@ -77,7 +83,8 @@ public struct WidgetSnapshot: Codable, Equatable {
         topModels: [SnapshotModelEntry] = [],
         sources: [SnapshotSourceEntry] = [],
         heatmap: HeatmapPayload = .empty,
-        limits: [LimitProvider] = []
+        limits: [LimitProvider] = [],
+        limitDisplayMode: WidgetLimitDisplayMode? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.generatedAt = generatedAt
@@ -92,11 +99,17 @@ public struct WidgetSnapshot: Codable, Equatable {
         self.sources = sources
         self.heatmap = heatmap
         self.limits = limits
+        self.limitDisplayMode = limitDisplayMode
     }
 
     public static let empty = WidgetSnapshot()
 
     // MARK: - Derived
+
+    /// True when limit rows should show what is left instead of what is used.
+    public var showsRemainingLimits: Bool {
+        limitDisplayMode == .remaining
+    }
 
     /// Tokens used on the calendar day before this snapshot was generated.
     /// `dailyTrend` contains only active days, so array position cannot identify yesterday.
@@ -248,6 +261,23 @@ public struct LimitProvider: Codable, Equatable, Identifiable {
         self.fraction = fraction
         self.resetsAt = resetsAt
     }
+
+    /// Used share clamped to 0...1. Drives the urgency color in both display
+    /// modes, matching the menu bar.
+    public var usedFraction: Double {
+        min(max(fraction, 0), 1)
+    }
+
+    /// The share a row shows: what is used, or what is left in remaining mode.
+    public func displayFraction(remaining: Bool) -> Double {
+        remaining ? 1 - usedFraction : usedFraction
+    }
+}
+
+/// Mirrors the app's `LimitDisplayMode`; Shared stays free of app-target types.
+public enum WidgetLimitDisplayMode: String, Codable {
+    case used
+    case remaining
 }
 
 // MARK: - Container IO

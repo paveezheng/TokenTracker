@@ -61,7 +61,7 @@ struct UsageLimitsWidgetView: View {
                 Spacer(minLength: 0)
                 VStack(alignment: .leading, spacing: rowGap) {
                     ForEach(trimmed) { (limit: LimitProvider) in
-                        LimitRow(limit: limit)
+                        LimitRow(limit: limit, remaining: entry.snapshot.showsRemainingLimits)
                     }
                 }
                 .fixedSize(horizontal: false, vertical: true)
@@ -76,12 +76,16 @@ struct UsageLimitsWidgetView: View {
 
 private struct LimitRow: View {
     let limit: LimitProvider
+    let remaining: Bool
 
     var body: some View {
-        let f = max(0, min(1, limit.fraction))
+        // The number and bar follow the app's Used/Remaining setting; color
+        // and urgency track actual usage so they read the same in both modes.
+        let used = limit.usedFraction
+        let f = limit.displayFraction(remaining: remaining)
         let reset = WidgetFormat.relativeReset(limit.resetsAt)
-        let urgent = f >= 0.9
-        let textColor: Color = urgent ? WidgetTheme.limitBarColor(f) : .primary
+        let urgent = used >= 0.9
+        let textColor: Color = urgent ? WidgetTheme.limitBarColor(used) : .primary
 
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
@@ -109,7 +113,7 @@ private struct LimitRow: View {
                     RoundedRectangle(cornerRadius: 3)
                         .fill(WidgetTheme.limitTrack)
                     RoundedRectangle(cornerRadius: 3)
-                        .fill(WidgetTheme.limitBarColor(f))
+                        .fill(WidgetTheme.limitBarColor(used))
                         .frame(width: max(geo.size.width * f, f > 0 ? 4 : 0))
                 }
             }
