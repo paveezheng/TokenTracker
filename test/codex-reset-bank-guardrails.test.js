@@ -135,6 +135,7 @@ test("Codex reset bank scope guard freezes widget menu bar and native bridge sur
   const model = read("TokenTrackerBar/TokenTrackerBar/Models/UsageLimits.swift");
   const usageLimitsView = read("TokenTrackerBar/TokenTrackerBar/Views/UsageLimitsView.swift");
   const widgetSnapshotWriter = read("TokenTrackerBar/TokenTrackerBar/Services/WidgetSnapshotWriter.swift");
+  const widgetLimitRows = read("TokenTrackerBar/TokenTrackerBar/Models/WidgetLimitRows.swift");
   const usageLimitsWidget = read("TokenTrackerBar/TokenTrackerWidget/Widgets/UsageLimitsWidget.swift");
   const menuBarDisplayPreferences = read("TokenTrackerBar/TokenTrackerBar/Models/MenuBarDisplayPreferences.swift");
   const nativeBridge = read("TokenTrackerBar/TokenTrackerBar/Services/NativeBridge.swift");
@@ -169,13 +170,17 @@ test("Codex reset bank scope guard freezes widget menu bar and native bridge sur
     "Menu-bar display preferences must not learn Reset Bank identity fields",
   );
 
-  const limitProviders = widgetSnapshotWriter.match(
-    /private static func limitProviders\(from limits: UsageLimitsResponse\?\) -> \[LimitProvider\] \{[\s\S]*?return out\.filter \{ !hiddenProviders\.contains\(\$0\.source\) \}\n    \}/,
+  const limitProviders = widgetLimitRows.match(
+    /static func rows\(from limits: UsageLimitsResponse\?, hiddenProviders: Set<String>\) -> \[LimitProvider\] \{[\s\S]*?return out\.filter \{ !hiddenProviders\.contains\(\$0\.source\) \}\n    \}/,
   );
-  assert.ok(limitProviders, "WidgetSnapshotWriter.limitProviders should be present");
-  assert.match(limitProviders[0], /LimitProvider\(source: "codex", label: "Codex · 5h"/);
-  assert.match(limitProviders[0], /LimitProvider\(source: "codex", label: "Codex · Spark 7d"/);
-  assertNoResetBankSurface(limitProviders[0], "WidgetSnapshotWriter provider rows");
+  assert.ok(limitProviders, "WidgetLimitRows.rows should be present");
+  assert.ok(
+    widgetSnapshotWriter.includes("WidgetLimitRows.rows("),
+    "WidgetSnapshotWriter should build widget rows through WidgetLimitRows",
+  );
+  assert.match(limitProviders[0], /addCodexWindow\("Codex · 5h", codex\.primaryWindow\)/);
+  assert.match(limitProviders[0], /addCodexWindow\("Codex · Spark 7d", codex\.sparkSecondaryWindow\)/);
+  assertNoResetBankSurface(limitProviders[0], "WidgetLimitRows provider rows");
   assert.ok(usageLimitsWidget.includes("entry.snapshot.limits"));
   assert.ok(usageLimitsWidget.includes("ForEach(trimmed)"));
   assertNoResetBankSurface(usageLimitsWidget, "UsageLimitsWidget");

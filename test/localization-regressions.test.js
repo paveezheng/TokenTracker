@@ -111,6 +111,8 @@ test("Codex Spark usage limits are wired through macOS consumers", () => {
   const model = read("TokenTrackerBar/TokenTrackerBar/Models/UsageLimits.swift");
   const usageLimitsView = read("TokenTrackerBar/TokenTrackerBar/Views/UsageLimitsView.swift");
   const widgetSnapshotWriter = read("TokenTrackerBar/TokenTrackerBar/Services/WidgetSnapshotWriter.swift");
+  const widgetLimitRows = read("TokenTrackerBar/TokenTrackerBar/Models/WidgetLimitRows.swift");
+  const widgetLimitLayout = read("TokenTrackerBar/Shared/WidgetLimitLayout.swift");
   const usageLimitsWidget = read("TokenTrackerBar/TokenTrackerWidget/Widgets/UsageLimitsWidget.swift");
   const widgetStrings = read("TokenTrackerBar/TokenTrackerWidget/Views/WidgetStrings.swift");
   const statusBarController = read("TokenTrackerBar/TokenTrackerBar/Services/StatusBarController.swift");
@@ -126,8 +128,9 @@ test("Codex Spark usage limits are wired through macOS consumers", () => {
   assert.match(usageLimitsView, /if let w = c\.sparkSecondaryWindow \{ s\.append\(makeSpec\("Spark 7d"/);
   assert.doesNotMatch(usageLimitsView, /makeSpec\("Sp [57][hd]"/);
 
-  assert.match(widgetSnapshotWriter, /if let w = limits\.codex\.sparkPrimaryWindow \{\s*out\.append\(LimitProvider\([^)]*label: "Codex · Spark 5h"/);
-  assert.match(widgetSnapshotWriter, /if let w = limits\.codex\.sparkSecondaryWindow \{\s*out\.append\(LimitProvider\([^)]*label: "Codex · Spark 7d"/);
+  assert.ok(widgetSnapshotWriter.includes("WidgetLimitRows.rows("));
+  assert.match(widgetLimitRows, /addCodexWindow\("Codex · Spark 5h", codex\.sparkPrimaryWindow\)/);
+  assert.match(widgetLimitRows, /addCodexWindow\("Codex · Spark 7d", codex\.sparkSecondaryWindow\)/);
   assert.ok(widgetStrings.includes("let kind = limitKind(limit.label)"));
   assert.ok(widgetStrings.includes('case "Spark 5h"'));
   assert.ok(widgetStrings.includes('case "Spark 7d"'));
@@ -142,8 +145,9 @@ test("Codex Spark usage limits are wired through macOS consumers", () => {
   ]) {
     assert.ok(widgetStrings.includes(localizedSparkLabel));
   }
-  assert.match(usageLimitsWidget, /let flat = orderedGroups\.flatMap \{ \$0 \}/);
-  assert.doesNotMatch(usageLimitsWidget, /flatMap \{ \$0\.sorted \{ \$0\.fraction > \$1\.fraction \} \}/);
+  assert.ok(usageLimitsWidget.includes("WidgetLimitLayout.rows("));
+  assert.match(widgetLimitLayout, /return orderedGroups\.flatMap \{ \$0 \}/);
+  assert.doesNotMatch(widgetLimitLayout, /flatMap \{ \$0\.sorted \{ \$0\.fraction > \$1\.fraction \} \}/);
 
   assert.ok(menuBarDisplayPreferences.includes("case codexSpark5h"));
   assert.ok(menuBarDisplayPreferences.includes("case codexSpark7d"));

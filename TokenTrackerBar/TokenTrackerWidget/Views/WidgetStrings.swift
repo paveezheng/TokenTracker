@@ -56,10 +56,18 @@ enum WidgetStrings {
         return (parts.last ?? label).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Display name before the "·" (e.g. "Ark Coding Plan"); `source.capitalized`
+    /// would mangle ids such as `codingPlan` into "Codingplan".
+    private static func limitProviderName(_ limit: LimitProvider) -> String {
+        let parts = limit.label.components(separatedBy: "·")
+        guard parts.count > 1 else { return limit.source.capitalized }
+        return parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     static func limitLabel(_ limit: LimitProvider) -> String {
         let label = limit.label
         let kind = limitKind(limit.label)
-        let source = limit.source.capitalized
+        let source = limitProviderName(limit)
         switch loc {
         case NativeLocalization.chineseLocale:
             switch kind {

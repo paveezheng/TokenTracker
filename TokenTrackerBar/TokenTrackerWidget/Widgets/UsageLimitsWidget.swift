@@ -3,7 +3,8 @@ import WidgetKit
 
 // Rate-limit progress widget. The bars ARE the widget. Providers are ordered
 // by their hottest window, while windows within a provider keep snapshot order
-// so paired quotas (5h, weekly, Spark 5h, Spark 7d) stay predictable.
+// so paired quotas (5h, weekly, Spark 5h, Spark 7d) stay predictable. The
+// medium size shows one row per provider so no provider crowds out the rest.
 
 struct UsageLimitsWidget: Widget {
     let kind: String = "TokenTrackerLimitsWidget"
@@ -27,23 +28,14 @@ struct UsageLimitsWidgetView: View {
         family == .systemMedium ? 4 : 8
     }
 
-    /// Sort providers so all windows from the same source stay adjacent
-    /// (Claude · 7d next to Claude · 5h). Sources are ordered by their
-    /// hottest window so the most-urgent provider floats to the top.
-    /// Within a source, keep the snapshot order emitted by the host app.
+    /// Medium: each provider's most-used window, hottest provider first.
+    /// Large: every window, grouped by provider (see `WidgetLimitLayout`).
     private var orderedRows: [LimitProvider] {
-        let grouped = Dictionary(grouping: entry.snapshot.limits, by: { $0.source })
-        // Order groups by their hottest window. Tie-break on source so equal-
-        // pressure providers keep a stable order instead of relying on the
-        // Dictionary's unstable iteration order (would reshuffle between refreshes).
-        let orderedGroups = grouped.values.sorted { lhs, rhs in
-            let lf = lhs.map(\.fraction).max() ?? 0
-            let rf = rhs.map(\.fraction).max() ?? 0
-            if lf != rf { return lf > rf }
-            return (lhs.first?.source ?? "") < (rhs.first?.source ?? "")
-        }
-        let flat = orderedGroups.flatMap { $0 }
-        return Array(flat.prefix(maxRows))
+        let rows = WidgetLimitLayout.rows(
+            entry.snapshot.limits,
+            onePerProvider: family == .systemMedium
+        )
+        return Array(rows.prefix(maxRows))
     }
 
     var body: some View {
