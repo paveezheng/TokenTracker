@@ -48,7 +48,7 @@ test("menu-bar popover keeps cached dashboard content visible during background 
 test("menu-bar popover restores Tahoe glass via deferred activation with a realign guard", () => {
   const source = readStatusBarController();
   const toggleStart = source.indexOf("private func togglePopover()");
-  const toggleEnd = source.indexOf("private func makePopoverAnchorWindow()");
+  const toggleEnd = source.indexOf("private func reshowPopoverOnActiveSpace()");
   const togglePopover = source.slice(toggleStart, toggleEnd);
   const didCloseStart = source.indexOf("private func handlePopoverDidClose()");
   const didCloseEnd = source.indexOf("// MARK: - Click Handling");
@@ -60,7 +60,7 @@ test("menu-bar popover restores Tahoe glass via deferred activation with a reali
   // gated on the popover still being shown, and followed by a realign guard.
   assert.match(
     togglePopover,
-    /DispatchQueue\.main\.async[\s\S]*?self\.popover\.isShown[\s\S]*?if\s+#available\(macOS\s+26,\s*\*\)\s*\{[\s\S]*?canActivateForPopoverGlass\(\)[\s\S]*?NSApp\.activate\(ignoringOtherApps:\s*true\)[\s\S]*?realignPopoverWithAnchorIfDisplaced\(\)/,
+    /DispatchQueue\.main\.async[\s\S]*?self\.popover\.isShown[\s\S]*?if\s+#available\(macOS\s+26,\s*\*\)\s*\{[\s\S]*?canActivateForPopoverGlass\(\)[\s\S]*?NSApp\.activate\(ignoringOtherApps:\s*true\)[\s\S]*?realignPopoverWithButtonIfDisplaced\(\)/,
     "Tahoe activation must be deferred past the anchoring pass, gated on popover.isShown plus the focus-steal guard, and followed by the realign guard (#481).",
   );
   assert.ok(
@@ -94,10 +94,10 @@ test("menu-bar popover restores Tahoe glass via deferred activation with a reali
     /if\s+ProcessInfo\.processInfo\.systemUptime\s*-\s*popoverShownAt\s*>\s*0\.5\s*\{\s*closePopoverIfShown\(\)\s*\}/,
     "One physical click on the full-screen revealed menu bar dispatches the button action twice (macOS 26); the close toggle must be debounced or the popover closes before it is ever seen.",
   );
-  assert.match(
+  assert.doesNotMatch(
     togglePopover,
-    /anchorWindow\.addChildWindow\(window,\s*ordered:\s*\.above\)/,
-    "The popover window must be attached as a child of the anchor window — an inactive app's popover is otherwise never admitted onto another app's full-screen Space.",
+    /addChildWindow/,
+    "The legacy popover path positions against the status button and must not parent itself to an app-owned window.",
   );
   assert.match(
     togglePopover,
@@ -126,28 +126,23 @@ test("menu-bar popover restores Tahoe glass via deferred activation with a reali
   );
   assert.match(
     source,
-    /private\s+func\s+positionPopoverAnchorWindow[\s\S]*?NSEvent\.mouseLocation[\s\S]*?clickScreen\s*!=\s*buttonScreen/,
-    "The anchor must follow the display the click happened on — the status item's real window can live on another display's menu bar (#481).",
-  );
-  assert.match(
-    handlePopoverDidClose,
-    /removeChildWindow\(popoverWindow\)/,
-    "Popover close must detach the reused popover window from the anchor or the next show inherits a stale child relationship.",
+    /private\s+func\s+statusButtonScreenRect[\s\S]*?NSEvent\.mouseLocation[\s\S]*?clickScreen\s*!=\s*buttonScreen/,
+    "Placement must follow the display the click happened on — the status item's real window can live on another display's menu bar (#481).",
   );
   assert.match(
     source,
-    /private\s+func\s+realignPopoverWithAnchorIfDisplaced\(\)\s*\{[\s\S]*?popoverWindow\.screen\s*!==\s*anchorWindow\.screen[\s\S]*?popoverWindow\.setFrame\(frame,\s*display:\s*true\)/,
-    "The realign guard must compare the popover window against the app-owned anchor and move it back when displaced (#481).",
+    /private\s+func\s+realignPopoverWithButtonIfDisplaced\(\)\s*\{[\s\S]*?popoverWindow\.screen\s*!==\s*screen[\s\S]*?popoverWindow\.setFrame\(frame,\s*display:\s*true\)/,
+    "The realign guard must compare the popover window against the clicked status button's screen and move it back when displaced (#481).",
   );
   assert.match(
     togglePopover,
-    /addChildWindow[\s\S]*?DispatchQueue\.main\.async\s*\{\s*\[weak self\]\s*in\s*self\?\.realignPopoverWithAnchorIfDisplaced\(\)\s*\}\s*popoverDismissMonitor/,
+    /DispatchQueue\.main\.async\s*\{\s*\[weak self\]\s*in\s*self\?\.realignPopoverWithButtonIfDisplaced\(\)\s*\}\s*popoverDismissMonitor/,
     "Every show must run a next-tick realign so an edge-clipped popover is pulled back on-screen.",
   );
   assert.match(
     source,
-    /private\s+func\s+realignPopoverWithAnchorIfDisplaced\(\)\s*\{[\s\S]*?guard\s+let\s+screen\s*=\s*anchorWindow\.screen[\s\S]*?frame\.origin\.x\s*=\s*PopoverPlacementPolicy\.originX\([\s\S]*?screenFrame:\s*screen\.frame/,
-    "Realign must screen-clamp the origin against the anchor's own screen; hard-centering or clamping against a wrong screen frame pushes the panel off-screen near an edge.",
+    /private\s+func\s+realignPopoverWithButtonIfDisplaced\(\)\s*\{[\s\S]*?guard\s+let\s+screen\s*=\s*NSScreen\.screens\.first\(where:\s*\{\s*\$0\.frame\.intersects\(buttonRect\)\s*\}\)[\s\S]*?frame\.origin\.x\s*=\s*PopoverPlacementPolicy\.originX\([\s\S]*?screenFrame:\s*screen\.frame/,
+    "Realign must screen-clamp the origin against the status button's own screen; hard-centering or clamping against a wrong screen frame pushes the panel off-screen near an edge.",
   );
   assert.match(
     togglePopover,
@@ -171,51 +166,66 @@ test("menu-bar popover restores Tahoe glass via deferred activation with a reali
   );
 });
 
-test("menu-bar popover is anchored to an app-owned positioning window", () => {
+test("menu-bar surface uses the system status item instead of an app-owned anchor", () => {
   const source = readStatusBarController();
   const didCloseStart = source.indexOf("forName: NSPopover.didCloseNotification");
   const didCloseEnd = source.indexOf("// MARK: - Click Handling");
   const didCloseObserver = source.slice(didCloseStart, didCloseEnd);
 
+  for (const symbol of [
+    "popoverAnchorWindow",
+    "makePopoverAnchorWindow",
+    "positionPopoverAnchorWindow",
+    "addChildWindow",
+    "discardPopoverAnchorWindow",
+  ]) {
+    assert.equal(source.includes(symbol), false, `The app-owned anchor must be gone: ${symbol}`);
+  }
+
   assert.match(
     source,
-    /private\s+var\s+popoverAnchorWindow:\s*NSPanel\?/,
-    "StatusBarController should keep an app-owned anchor window for stable popover positioning.",
+    /popover\.show\(relativeTo:\s*button\.bounds,\s*of:\s*button,\s*preferredEdge:\s*\.minY\)/,
+    "macOS 26 and earlier must present the popover directly against the status button.",
   );
   assert.match(
     source,
-    /private\s+func\s+makePopoverAnchorWindow\(\)\s*->\s*NSPanel\s*\{[\s\S]*?NSPanel\([\s\S]*?styleMask:\s*\[\.borderless,\s*\.nonactivatingPanel\][\s\S]*?hidesOnDeactivate\s*=\s*false[\s\S]*?collectionBehavior\s*=\s*\[[^\]]*\.canJoinAllSpaces[^\]]*\.fullScreenAuxiliary[^\]]*\.ignoresCycle[^\]]*\.stationary[^\]]*\]/,
-    "The anchor must be a borderless non-activating panel that stays up on deactivation: while the Dashboard is open the app is .regular, and a regular app's plain window is never admitted onto another app's full-screen Space.",
+    /statusItem\.expandedInterfaceDelegate\s*=\s*self/,
+    "macOS 27 must hand the status item's expanded interface to the controller.",
   );
   assert.match(
     source,
-    /private\s+func\s+positionPopoverAnchorWindow[\s\S]*?discardPopoverAnchorWindow\(\)\s*let\s+window\s*=\s*makePopoverAnchorWindow\(\)/,
-    "Every open must build a new anchor: an anchor ordered in under .regular stayed pinned to a desktop Space for the rest of the process.",
-  );
-  assert.doesNotMatch(
-    source,
-    /popoverAnchorWindow\s*\?\?\s*makePopoverAnchorWindow\(\)/,
-    "The anchor must not be reused across opens.",
+    /func\s+statusItem\(\s*_ statusItem:\s*NSStatusItem,\s*didBegin session:\s*NSStatusItemExpandedInterfaceSession\s*\)\s*\{[\s\S]*?presentExpandedInterfacePanel\(\)/,
+    "didBegin must show a panel under the status item.",
   );
   assert.match(
     source,
-    /private\s+func\s+discardPopoverAnchorWindow\(\)\s*\{[\s\S]*?popoverAnchorWindow\s*=\s*nil[\s\S]*?removeChildWindow[\s\S]*?\.close\(\)/,
-    "Discarding the anchor must detach the reused popover window before closing it, or the next show skips attaching the popover to the new anchor.",
+    /func\s+statusItemDidEndExpandedInterfaceSession\(_ statusItem:\s*NSStatusItem,\s*animated:\s*Bool\)\s*\{[\s\S]*?teardownExpandedInterface\(\)/,
+    "didEnd must tear the expanded panel down. The session is already nil by then, so this path must not cancel it.",
   );
   assert.match(
     source,
-    /private\s+func\s+positionPopoverAnchorWindow\(under\s+button:\s*NSStatusBarButton\)\s*->\s*NSView\?[\s\S]*button\.window[\s\S]*convertToScreen[\s\S]*setFrame\(anchorFrame,\s*display:\s*false\)[\s\S]*orderFrontRegardless\(\)/,
-    "The anchor window should be positioned from the clicked status button's screen rect before showing the popover.",
+    /statusItem\.expandedInterfaceSession\?\.cancel\(\)/,
+    "A popover did-close while a macOS 27 session is still active must cancel that session.",
   );
   assert.match(
     source,
-    /guard\s+let\s+anchorView\s*=\s*positionPopoverAnchorWindow\(under:\s*button\)[\s\S]*popover\.show\(relativeTo:\s*anchorView\.bounds,\s*of:\s*anchorView,\s*preferredEdge:\s*\.minY\)/,
-    "The popover should show relative to the app-owned anchor view, not the system status button window.",
+    /if\s+let\s+session\s*=\s*statusItem\.expandedInterfaceSession\s*\{\s*session\.cancel\(\)/,
+    "Closing the menu-bar surface must cancel the system session before any legacy popover close.",
   );
   assert.match(
     source,
-    /private\s+func\s+closePopoverIfShown\(\)\s*\{[\s\S]*if\s+popover\.isShown\s*\{[\s\S]*popover\.performClose\(nil\)[\s\S]*\}\s*popoverAnchorWindow\?\.orderOut\(nil\)/,
-    "Closing the popover path should also hide the app-owned anchor window.",
+    /NSPanel\([\s\S]*?styleMask:\s*\[\.borderless,\s*\.nonactivatingPanel\][\s\S]*?hidesOnDeactivate\s*=\s*false[\s\S]*?collectionBehavior\s*=\s*\[[^\]]*\.canJoinAllSpaces[^\]]*\.fullScreenAuxiliary[^\]]*\]/,
+    "The macOS 27 panel must be a non-activating panel that can join full-screen Spaces, and it must stay visible when the app is not active.",
+  );
+  assert.match(
+    source,
+    /NSClassFromString\("NSGlassEffectView"\)/,
+    "The expanded panel has no popover chrome, so it must supply Liquid Glass behind the transparent dashboard content.",
+  );
+  assert.match(
+    source,
+    /private\s+func\s+closePopoverIfShown\(\)\s*\{[\s\S]*if\s+popover\.isShown\s*\{[\s\S]*popover\.performClose\(nil\)/,
+    "The legacy close path must still close the popover.",
   );
   assert.match(
     source,

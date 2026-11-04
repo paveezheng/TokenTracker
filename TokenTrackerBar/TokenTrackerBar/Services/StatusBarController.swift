@@ -18,6 +18,11 @@ final class StatusBarController: NSObject {
         instance?.closePopoverForModalAlert()
     }
 
+    /// Dashboard 打开时收起菜单栏界面。27 上要取消 expanded session，不能只按窗口类名去关。
+    static func dismissMenuBarSurface() {
+        instance?.closePopoverIfShown()
+    }
+
     /// Popover height adapts to content: shorter on macOS < 13 where the Charts module is unavailable.
     private static let popoverHeight: CGFloat = {
         if #available(macOS 13, *) { return 720 }
@@ -26,8 +31,16 @@ final class StatusBarController: NSObject {
 
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let popover = NSPopover()
-    private var popoverAnchorWindow: NSPanel?
+    /// macOS 27 presents this panel from `NSStatusItem.expandedInterfaceDelegate`.
+    /// It is created for one session and thrown away on close, so a Space
+    /// assignment from an earlier open cannot pin the UI to a desktop.
+    private var expandedInterfacePanel: NSPanel?
+    private var expandedInterfaceHostingController: NSViewController?
+    private var expandedInterfaceDismissMonitor: Any?
     private var popoverDismissMonitor: Any?
+    /// Suppresses a second context menu when both the expanded-interface
+    /// session and the button action see the same right click.
+    private var contextMenuPresentedAt: TimeInterval = 0
     /// systemUptime when the popover was last shown — the debounce reference for
     /// duplicated status-button action dispatches (full-screen menu bar reveal).
     private var popoverShownAt: TimeInterval = 0
@@ -147,11 +160,29 @@ final class StatusBarController: NSObject {
     }
 
     private func closePopoverIfShown() {
+        if endExpandedInterfaceIfNeeded() {
+            return
+        }
         viewModel.setPopoverVisible(false)
         if popover.isShown {
             popover.performClose(nil)
         }
-        popoverAnchorWindow?.orderOut(nil)
+    }
+
+    /// Ends a macOS 27 status-item session, or a panel opened without one.
+    /// `didEnd` performs the actual teardown after `cancel()`. Returns true when
+    /// this call owned the close, so the legacy popover path must not also run.
+    private func endExpandedInterfaceIfNeeded() -> Bool {
+        guard #available(macOS 27.0, *) else { return false }
+        if let session = statusItem.expandedInterfaceSession {
+            session.cancel()
+            return true
+        }
+        guard expandedInterfacePanel != nil else { return false }
+        teardownExpandedInterface()
+        viewModel.setPopoverVisible(false)
+        updateStatsDisplay()
+        return true
     }
 
     /// React to setting changes pushed by the dashboard SettingsPage via NativeBridge.
@@ -271,6 +302,10 @@ final class StatusBarController: NSObject {
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         button.action = #selector(handleClick(_:))
         button.target = self
+        if #available(macOS 27.0, *) {
+            // The system owns show/hide. Assigning an NSMenu would suppress these callbacks.
+            statusItem.expandedInterfaceDelegate = self
+        }
         updateMenuBarIconVisibility()
 
         animator = MenuBarAnimator(button: button)
@@ -397,11 +432,11 @@ final class StatusBarController: NSObject {
         guard let button = statusItem.button else { return }
         let displayItems = buildMenuBarDisplayValues()
 
-        // Freeze statusItem.length while the popover is shown: stats publishers and
-        // animator frames both call this method, and a flicker in length drags the
-        // popover anchor sideways. The didCloseNotification observer realigns width
-        // after the popover closes.
-        let canResizeStatusItem = !popover.isShown
+        // Freeze statusItem.length while the menu-bar surface is shown: stats
+        // publishers and animator frames both call this method, and a flicker in
+        // length drags the popover or expanded panel sideways. Close paths
+        // realign the width once the surface is gone.
+        let canResizeStatusItem = !isMenuBarSurfacePresented
 
         if showStats && !displayItems.isEmpty {
             let signature = statsTextSignature(displayItems)
@@ -784,7 +819,16 @@ final class StatusBarController: NSObject {
 
     // MARK: - Popover
 
+    private var isMenuBarSurfacePresented: Bool {
+        if popover.isShown { return true }
+        return expandedInterfacePanel?.isVisible == true
+    }
+
     private func setupPopover() {
+        if #available(macOS 27.0, *) {
+            // The expanded panel builds a fresh hosting controller per session.
+            return
+        }
         let rootView = DashboardView(viewModel: viewModel, serverManager: serverManager)
             .frame(width: 480, height: Self.popoverHeight)
 
@@ -811,14 +855,13 @@ final class StatusBarController: NSObject {
             NSEvent.removeMonitor(popoverDismissMonitor)
             self.popoverDismissMonitor = nil
         }
-        // Detach the reused popover window from the anchor before hiding the
-        // anchor, or the next show inherits a stale child relationship.
-        if let popoverWindow = popover.contentViewController?.view.window,
-           popoverWindow.parent === popoverAnchorWindow {
-            popoverAnchorWindow?.removeChildWindow(popoverWindow)
+        // A popover close on macOS 27 is not the expanded-interface shell. If a
+        // system session is still active, end it so the status item highlight
+        // clears with the window. `didEnd` tears the panel down.
+        if #available(macOS 27.0, *) {
+            statusItem.expandedInterfaceSession?.cancel()
         }
         viewModel.setPopoverVisible(false)
-        popoverAnchorWindow?.orderOut(nil)
         updateStatsDisplay()
     }
 
@@ -826,6 +869,24 @@ final class StatusBarController: NSObject {
 
     @objc private func handleClick(_ sender: NSStatusBarButton) {
         guard let event = NSApp.currentEvent else { return }
+
+        if #available(macOS 27.0, *) {
+            if event.type == .rightMouseUp {
+                // Never assign `statusItem.menu`: that suppresses later expanded-interface callbacks.
+                if statusItem.expandedInterfaceSession != nil {
+                    statusItem.expandedInterfaceSession?.cancel()
+                } else if expandedInterfacePanel != nil {
+                    teardownExpandedInterface()
+                    viewModel.setPopoverVisible(false)
+                    updateStatsDisplay()
+                }
+                presentContextMenu()
+                return
+            }
+            // Left click is owned by `expandedInterfaceDelegate`. Ignore a leftover
+            // button action so it cannot dismiss the session `didBegin` just opened.
+            return
+        }
 
         if event.type == .rightMouseUp {
             showMenu()
@@ -836,6 +897,10 @@ final class StatusBarController: NSObject {
     }
 
     private func togglePopover() {
+        if #available(macOS 27.0, *) {
+            presentExpandedInterfacePanel()
+            return
+        }
         guard let button = statusItem.button else { return }
 
         if popover.isShown {
@@ -849,7 +914,6 @@ final class StatusBarController: NSObject {
             return
         }
 
-        guard let anchorView = positionPopoverAnchorWindow(under: button) else { return }
         // The window's Space assignment happens inside popover.show(). The
         // reused _NSPopoverWindow keeps the desktop it was first ordered in on,
         // and on macOS 26 the post-show insert below is applied too late — the
@@ -859,31 +923,22 @@ final class StatusBarController: NSObject {
         if let reusedWindow = popover.contentViewController?.view.window {
             reusedWindow.collectionBehavior.insert([.canJoinAllSpaces, .fullScreenAuxiliary])
         }
-        popover.show(relativeTo: anchorView.bounds, of: anchorView, preferredEdge: .minY)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popoverShownAt = ProcessInfo.processInfo.systemUptime
         viewModel.setPopoverVisible(true)
 
         // Keep keyboard focus inside the popover while it is visible.
         if let window = popover.contentViewController?.view.window {
             // The _NSPopoverWindow is reused across shows and its default
-            // collectionBehavior is only .ignoresCycle — it does NOT inherit the
-            // anchor window's .canJoinAllSpaces, so it stays pinned to the Space it
+            // collectionBehavior is only .ignoresCycle — it does not follow the
+            // status button onto every Space, so it stays pinned to the Space it
             // was first ordered in on and reopens on the wrong desktop (#372).
             // Use .canJoinAllSpaces (not .moveToActiveSpace, which only migrates on
             // app *activation* and is a no-op when the app is already active, e.g.
-            // while the Dashboard window is frontmost). .fullScreenAuxiliary matches
-            // the anchor window so the popover also shows over full-screen Spaces.
+            // while the Dashboard window is frontmost). .fullScreenAuxiliary lets
+            // the popover show over full-screen Spaces.
             window.collectionBehavior.insert([.canJoinAllSpaces, .fullScreenAuxiliary])
-            // Over another app's full-screen Space, an inactive app's popover is
-            // not admitted onto the Space and never becomes visible even though
-            // isVisible reports true (collectionBehavior alone doesn't help — the
-            // Space assignment already happened during show). Attach the popover
-            // window as a child of the status-bar-level anchor window, which is
-            // admitted everywhere, so the popover inherits its Space placement.
             window.level = .statusBar
-            if let anchorWindow = popoverAnchorWindow, window.parent == nil {
-                anchorWindow.addChildWindow(window, ordered: .above)
-            }
             window.orderFrontRegardless()
             window.makeKey()
 
@@ -893,22 +948,21 @@ final class StatusBarController: NSObject {
             // app's Space/window association mid-anchor and strand the popover on
             // another display (#481), so defer activation until the popover has
             // anchored, gate it on no other window being able to steal key focus,
-            // then realign the popover with its anchor if activation displaced it.
+            // then realign the popover with the status button if activation displaced it.
             // Older systems use the classic material and stay non-activating
             // unless the popover missed the active Space.
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.popover.isShown else { return }
-                // Check the popover window itself, not the anchor: the anchor
-                // is .canJoinAllSpaces, so it reports admitted on every regular
-                // Space even when the popover window stayed pinned to another
-                // desktop (#506).
+                // Check the popover window itself. A positioning view that joins
+                // every Space reports admitted even when the popover stayed
+                // pinned to another desktop (#506).
                 let popoverAdmitted = self.popover.contentViewController?.view.window?.isOnActiveSpace ?? true
                 if popoverAdmitted {
                     if #available(macOS 26, *) {
                         guard self.canActivateForPopoverGlass() else { return }
                         NSApp.activate(ignoringOtherApps: true)
                         DispatchQueue.main.async { [weak self] in
-                            self?.realignPopoverWithAnchorIfDisplaced()
+                            self?.realignPopoverWithButtonIfDisplaced()
                         }
                     }
                 } else {
@@ -917,10 +971,10 @@ final class StatusBarController: NSObject {
                     // Space (admits no window of an inactive app), or the
                     // reused popover window stayed pinned to the desktop it
                     // was first ordered in on (#506). Activation is the only
-                    // way in; then re-show it once at the same anchor. This
-                    // runs on every macOS version: the child-window attach
-                    // alone does not get it onto a full-screen Space on
-                    // macOS 15 (#681).
+                    // way in; then re-show it once under the status button.
+                    // This runs on every macOS version, including macOS 15
+                    // where collection behavior alone does not admit the
+                    // popover onto another app's full-screen Space (#681).
                     NSApp.activate(ignoringOtherApps: true)
                     DispatchQueue.main.async { [weak self] in
                         self?.reshowPopoverOnActiveSpace()
@@ -933,7 +987,7 @@ final class StatusBarController: NSObject {
         // up off-screen. Re-check once the window server has committed the
         // show; a correctly placed popover is a no-op.
         DispatchQueue.main.async { [weak self] in
-            self?.realignPopoverWithAnchorIfDisplaced()
+            self?.realignPopoverWithButtonIfDisplaced()
         }
 
         popoverDismissMonitor = NSEvent.addGlobalMonitorForEvents(
@@ -966,7 +1020,7 @@ final class StatusBarController: NSObject {
                 DispatchQueue.main.async { [weak self] in self?.togglePopover() }
                 return
             }
-            realignPopoverWithAnchorIfDisplaced()
+            realignPopoverWithButtonIfDisplaced()
             return
         }
         guard !popoverReshowAttempted else { return }
@@ -978,16 +1032,18 @@ final class StatusBarController: NSObject {
     // (typically the Dashboard) is visible on another screen or Space, activating
     // steals key from the popover and dismisses the transient popover outright, or
     // drags it across displays (#481). Only report it safe to activate when every
-    // key-capable visible window already lives on the anchor's screen and Space —
-    // otherwise keep Tahoe's subdued glass and the guaranteed correct placement.
+    // key-capable visible window already lives on the status button's screen and
+    // Space — otherwise keep Tahoe's subdued glass and the guaranteed placement.
     private func canActivateForPopoverGlass() -> Bool {
-        guard let anchorScreen = popoverAnchorWindow?.screen else { return false }
+        guard let button = statusItem.button,
+              let buttonRect = statusButtonScreenRect(for: button),
+              let anchorScreen = NSScreen.screens.first(where: { $0.frame.intersects(buttonRect) })
+                ?? button.window?.screen else { return false }
         let popoverWindow = popover.contentViewController?.view.window
         for window in NSApp.windows {
             guard window.isVisible,
                   window.canBecomeKey,
                   !(window is NSPanel),
-                  window !== popoverAnchorWindow,
                   window !== popoverWindow else { continue }
             if window.screen !== anchorScreen || !window.isOnActiveSpace {
                 return false
@@ -997,78 +1053,44 @@ final class StatusBarController: NSObject {
     }
 
     // App-wide activation can still yank the reused _NSPopoverWindow onto another
-    // display's Space (#481). The anchor window is canJoinAllSpaces and pinned in
-    // screen coordinates under the clicked status item, so it is the ground truth:
-    // if the popover window strayed from it, move the popover window back. The
-    // restored position is screen-clamped — hard-centering under the anchor pushes
-    // the panel off-screen when the icon sits near a screen edge.
-    private func realignPopoverWithAnchorIfDisplaced() {
+    // display's Space (#481). The clicked status button, corrected onto the
+    // display that received the click, is the ground truth: if the popover
+    // strayed from it, move the popover back. The restored position is
+    // screen-clamped — hard-centering under the button pushes the panel
+    // off-screen when the icon sits near a screen edge.
+    private func realignPopoverWithButtonIfDisplaced() {
         guard popover.isShown,
               let popoverWindow = popover.contentViewController?.view.window,
-              let anchorWindow = popoverAnchorWindow else { return }
-        guard let screen = anchorWindow.screen
-            ?? NSScreen.screens.first(where: { $0.frame.intersects(anchorWindow.frame) })
+              let button = statusItem.button,
+              let buttonRect = statusButtonScreenRect(for: button) else { return }
+        guard let screen = NSScreen.screens.first(where: { $0.frame.intersects(buttonRect) })
             ?? NSScreen.main else { return }
-        let anchor = anchorWindow.frame
         var frame = popoverWindow.frame
-        let displaced = popoverWindow.screen !== anchorWindow.screen
+        let displaced = popoverWindow.screen !== screen
             || PopoverPlacementPolicy.isDisplaced(
                 popoverFrame: frame,
-                anchorFrame: anchor,
+                anchorFrame: buttonRect,
                 screenFrame: screen.frame
             )
         guard displaced else { return }
         frame.origin.x = PopoverPlacementPolicy.originX(
             bodyWidth: frame.width,
-            anchorMidX: anchor.midX,
+            anchorMidX: buttonRect.midX,
             screenFrame: screen.frame
         )
-        frame.origin.y = anchor.minY - frame.height
+        frame.origin.y = buttonRect.minY - frame.height
         popoverWindow.setFrame(frame, display: true)
     }
 
-    // The anchor is a non-activating panel, not a plain window: while the
-    // Dashboard is open the app runs with the .regular activation policy, and a
-    // regular app's plain window is never admitted onto another app's
-    // full-screen Space — the child popover then lands on a desktop Space and
-    // stays invisible. Worse, an anchor ordered in under .regular stays pinned
-    // to that desktop even after the Dashboard closes and the app is back to
-    // .accessory, so every later full-screen open failed until relaunch. A
-    // .nonactivatingPanel is admitted under either policy, like the confetti,
-    // pet and Dynamic Island panels.
-    private func makePopoverAnchorWindow() -> NSPanel {
-        let anchorSize = NSSize(width: 2, height: 1)
-        let window = NSPanel(
-            contentRect: NSRect(origin: .zero, size: anchorSize),
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
-        // NSPanel hides on deactivation by default, which would take the child
-        // popover down with it whenever another app becomes active.
-        window.hidesOnDeactivate = false
-        window.contentView = NSView(frame: NSRect(origin: .zero, size: anchorSize))
-        window.backgroundColor = .clear
-        window.alphaValue = 0
-        window.isOpaque = false
-        window.hasShadow = false
-        window.ignoresMouseEvents = true
-        window.level = .statusBar
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .stationary]
-        window.isReleasedWhenClosed = false
-        return window
-    }
-
-    private func positionPopoverAnchorWindow(under button: NSStatusBarButton) -> NSView? {
+    /// Screen rect of the status button. The item is drawn on every display's
+    /// menu bar, but its real window lives on only one of them. A click on
+    /// another display's mirrored copy is placed under the cursor on that
+    /// display (#481).
+    private func statusButtonScreenRect(for button: NSStatusBarButton) -> NSRect? {
         guard let buttonWindow = button.window else { return nil }
         let buttonRectInWindow = button.convert(button.bounds, to: nil)
         var buttonRectOnScreen = buttonWindow.convertToScreen(buttonRectInWindow)
 
-        // The status item is rendered on every display's menu bar, but its real
-        // window lives on only one of them. When the click happened on another
-        // display's mirrored copy, anchor under the cursor on that display —
-        // anchoring to the real window would open the popover on the wrong
-        // display (#481).
         let mouse = NSEvent.mouseLocation
         if let buttonScreen = buttonWindow.screen,
            let clickScreen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }),
@@ -1077,33 +1099,154 @@ final class StatusBarController: NSObject {
             buttonRectOnScreen.origin.x = mouse.x - buttonRectOnScreen.width / 2
             buttonRectOnScreen.origin.y = clickScreen.frame.maxY - menuBarTopOffset
         }
-
-        let anchorSize = NSSize(width: 2, height: 1)
-        let anchorFrame = NSRect(
-            x: buttonRectOnScreen.midX - anchorSize.width / 2,
-            y: buttonRectOnScreen.minY,
-            width: anchorSize.width,
-            height: anchorSize.height
-        )
-        // Build a new anchor for every open instead of reusing the last one, so
-        // no Space assignment from an earlier open (or an earlier activation
-        // policy) can carry over into this one.
-        discardPopoverAnchorWindow()
-        let window = makePopoverAnchorWindow()
-        popoverAnchorWindow = window
-        window.setFrame(anchorFrame, display: false)
-        window.orderFrontRegardless()
-        return window.contentView
+        return buttonRectOnScreen
     }
 
-    private func discardPopoverAnchorWindow() {
-        guard let anchorWindow = popoverAnchorWindow else { return }
-        popoverAnchorWindow = nil
-        // Detach the reused popover window first: it must not stay a child of
-        // the old anchor, or the next show would skip attaching it to the new one.
-        anchorWindow.childWindows?.forEach { anchorWindow.removeChildWindow($0) }
-        anchorWindow.orderOut(nil)
-        anchorWindow.close()
+    // MARK: - macOS 27 expanded interface
+
+    /// Shows a fresh panel under the status item. Called from the system session
+    /// and from any programmatic open. The panel is never reused.
+    private func presentExpandedInterfacePanel() {
+        guard let button = statusItem.button,
+              let buttonRect = statusButtonScreenRect(for: button) else { return }
+        teardownExpandedInterface()
+
+        let size = NSSize(width: 480, height: Self.popoverHeight)
+        let panel = NSPanel(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        // NSPanel hides on deactivation by default, which would remove the
+        // surface as soon as the full-screen app is the active one.
+        panel.hidesOnDeactivate = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .statusBar
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        panel.isReleasedWhenClosed = false
+        panel.isMovable = false
+
+        let rootView = DashboardView(viewModel: viewModel, serverManager: serverManager)
+            .frame(width: size.width, height: size.height)
+        let hostingController = NSHostingController(rootView: AnyView(rootView))
+        if #available(macOS 13.0, *) {
+            hostingController.sizingOptions = []
+        }
+        hostingController.view.frame = NSRect(origin: .zero, size: size)
+        hostingController.view.autoresizingMask = [.width, .height]
+        // PopoverSurfaceBackground is clear on macOS 26+, so the hosting view
+        // must not paint an opaque fill over the glass chrome.
+        hostingController.view.wantsLayer = true
+        hostingController.view.layer?.backgroundColor = NSColor.clear.cgColor
+        expandedInterfaceHostingController = hostingController
+
+        let container = makeExpandedInterfaceContainer(size: size, hostingView: hostingController.view)
+        panel.contentView = container
+
+        let screen = NSScreen.screens.first(where: { $0.frame.intersects(buttonRect) })
+            ?? button.window?.screen
+            ?? NSScreen.main
+        var frame = NSRect(origin: .zero, size: size)
+        if let screen {
+            frame.origin.x = PopoverPlacementPolicy.originX(
+                bodyWidth: size.width,
+                anchorMidX: buttonRect.midX,
+                screenFrame: screen.frame
+            )
+            frame.origin.y = buttonRect.minY - size.height
+        }
+        panel.setFrame(frame, display: false)
+        expandedInterfacePanel = panel
+        panel.orderFrontRegardless()
+        panel.makeKey()
+        viewModel.setPopoverVisible(true)
+        installExpandedInterfaceDismissMonitor()
+        Task { await viewModel.refreshForPopoverOpen() }
+    }
+
+    private func makeExpandedInterfaceContainer(size: NSSize, hostingView: NSView) -> NSView {
+        let container = NSView(frame: NSRect(origin: .zero, size: size))
+        container.wantsLayer = true
+        container.layer?.cornerRadius = 16
+        container.layer?.cornerCurve = .continuous
+        container.layer?.masksToBounds = true
+
+        let chrome = makeExpandedInterfaceChrome()
+        chrome.frame = container.bounds
+        chrome.autoresizingMask = [.width, .height]
+        container.addSubview(chrome)
+
+        hostingView.frame = container.bounds
+        hostingView.autoresizingMask = [.width, .height]
+        container.addSubview(hostingView)
+        return container
+    }
+
+    /// The expanded panel has no `NSPopover` chrome. `PopoverSurfaceBackground`
+    /// stays clear on macOS 26+, so the glass has to live behind the SwiftUI view.
+    private func makeExpandedInterfaceChrome() -> NSView {
+        if #available(macOS 26.0, *),
+           let glassClass = NSClassFromString("NSGlassEffectView") as? NSView.Type {
+            let glass = glassClass.init(frame: .zero)
+            if glass.responds(to: NSSelectorFromString("setCornerRadius:")) {
+                glass.setValue(NSNumber(value: 16.0), forKey: "cornerRadius")
+            }
+            // The effect view does not draw until it has a content view. Keep that
+            // view empty; the dashboard hosting view sits above the glass.
+            if glass.responds(to: NSSelectorFromString("setContentView:")) {
+                let content = NSView(frame: .zero)
+                content.translatesAutoresizingMaskIntoConstraints = false
+                glass.setValue(content, forKey: "contentView")
+                NSLayoutConstraint.activate([
+                    content.leadingAnchor.constraint(equalTo: glass.leadingAnchor),
+                    content.trailingAnchor.constraint(equalTo: glass.trailingAnchor),
+                    content.topAnchor.constraint(equalTo: glass.topAnchor),
+                    content.bottomAnchor.constraint(equalTo: glass.bottomAnchor),
+                ])
+            }
+            return glass
+        }
+        let visual = NSVisualEffectView()
+        visual.material = .popover
+        visual.blendingMode = .behindWindow
+        visual.state = .active
+        return visual
+    }
+
+    private func installExpandedInterfaceDismissMonitor() {
+        if let expandedInterfaceDismissMonitor {
+            NSEvent.removeMonitor(expandedInterfaceDismissMonitor)
+            self.expandedInterfaceDismissMonitor = nil
+        }
+        // Clicks in this app's other windows end the session. Clicks on the
+        // status item itself stay with the system, which begins and ends the
+        // session. Clicks in other apps are not local events.
+        expandedInterfaceDismissMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] event in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if event.window === self.expandedInterfacePanel { return }
+                if event.window === self.statusItem.button?.window { return }
+                self.closePopoverIfShown()
+            }
+            return event
+        }
+    }
+
+    private func teardownExpandedInterface() {
+        if let expandedInterfaceDismissMonitor {
+            NSEvent.removeMonitor(expandedInterfaceDismissMonitor)
+            self.expandedInterfaceDismissMonitor = nil
+        }
+        expandedInterfaceHostingController = nil
+        let panel = expandedInterfacePanel
+        expandedInterfacePanel = nil
+        panel?.orderOut(nil)
+        panel?.close()
     }
 
     // MARK: - Right-Click Menu
@@ -1134,6 +1277,16 @@ final class StatusBarController: NSObject {
         statusItem.menu = menu
         statusItem.button?.performClick(nil)
         statusItem.menu = nil
+    }
+
+    /// Right-click on macOS 27. Does not assign `statusItem.menu`.
+    private func presentContextMenu() {
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - contextMenuPresentedAt < 0.5 { return }
+        contextMenuPresentedAt = now
+        let menu = buildMenu()
+        trackedStatusMenu = menu
+        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
     }
 
     private func buildMenu() -> NSMenu {
@@ -1529,5 +1682,27 @@ extension StatusBarController: NSMenuDelegate {
             NotificationCenter.default.removeObserver(observer)
             updateMenuStatusObserver = nil
         }
+    }
+}
+
+@available(macOS 27.0, *)
+extension StatusBarController: NSStatusItemExpandedInterfaceDelegate {
+    func statusItem(
+        _ statusItem: NSStatusItem,
+        didBegin session: NSStatusItemExpandedInterfaceSession
+    ) {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            session.cancel()
+            presentContextMenu()
+            return
+        }
+        presentExpandedInterfacePanel()
+    }
+
+    func statusItemDidEndExpandedInterfaceSession(_ statusItem: NSStatusItem, animated: Bool) {
+        _ = animated
+        teardownExpandedInterface()
+        viewModel.setPopoverVisible(false)
+        updateStatsDisplay()
     }
 }

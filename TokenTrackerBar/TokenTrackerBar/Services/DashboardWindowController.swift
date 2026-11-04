@@ -71,10 +71,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
     /// `DashboardPresentationCoordinator` so every open/close entry shares the
     /// same lifecycle contract.
     func presentWindow() {
-        // Close the menu bar popover.
-        for window in NSApp.windows where window.className.contains("Popover") {
-            window.close()
-        }
+        StatusBarController.dismissMenuBarSurface()
 
         // Reuse existing window if possible
         if let window {
