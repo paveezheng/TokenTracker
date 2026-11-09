@@ -246,6 +246,65 @@ test("index: Kimi K3.1 Pro and gemini-4-argon priced via public API", () => {
   assert.equal(argon.cache_read, 0.1);
 });
 
+test("index: Antigravity gemini-4-argon backend variants inherit the published Argon rate (#1072)", () => {
+  const pricing = require("../src/lib/pricing");
+  const expected = { input: 2, output: 10, cache_read: 0.1 };
+  // Backend telemetry suffixes (-b, -trial) and the dotted spelling are the
+  // same Gemini 4 Argon public list rate already curated on the base id.
+  // Do not invent a new SKU; match Cloud Edge's substring matcher.
+  for (const model of ["gemini-4-argon-b", "gemini-4-argon-trial", "gemini-4.argon-b"]) {
+    for (const source of [undefined, "antigravity", "cursor"]) {
+      const info = pricing.getModelPricingInfo(model, source ? { source } : {});
+      assert.equal(info.status, "priced", `${model} ${source || "no-source"}`);
+      assert.equal(info.input, expected.input, `${model} input`);
+      assert.equal(info.output, expected.output, `${model} output`);
+      assert.equal(info.cache_read, expected.cache_read, `${model} cache_read`);
+    }
+  }
+  const base = pricing.getModelPricingInfo("gemini-4-argon", { source: "antigravity" });
+  assert.equal(base.status, "priced");
+  assert.equal(base.input, 2);
+});
+
+test("index: Antigravity Gemini 3.6/3.7/3.8 Flash use published Standard promo rates (#1063)", () => {
+  const pricing = require("../src/lib/pricing");
+  const flash25 = { input: 0.3, output: 2.5, cache_read: 0.03 };
+  for (const model of ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]) {
+    const info = pricing.getModelPricingInfo(model, { source: "antigravity" });
+    assert.equal(info.status, "priced", model);
+    assert.equal(info.input, 0.75, model);
+    assert.equal(info.output, 3.75, model);
+    assert.equal(info.cache_read, 0.075, model);
+    assert.notDeepEqual(
+      { input: info.input, output: info.output, cache_read: info.cache_read },
+      flash25,
+      `${model} must not inherit gemini-2.5-flash rates`,
+    );
+  }
+  const named = pricing.getModelPricingInfo("Gemini 3.8 Flash", { source: "antigravity" });
+  assert.equal(named.status, "priced");
+  assert.equal(named.input, 0.75);
+  assert.equal(named.output, 3.75);
+  assert.equal(named.cache_read, 0.075);
+
+  const flash35 = pricing.getModelPricingInfo("gemini-3.5-flash", { source: "antigravity" });
+  assert.equal(flash35.status, "priced");
+  assert.equal(flash35.source, "curated:exact");
+  assert.equal(flash35.input, 1.5);
+  assert.equal(flash35.output, 9);
+  assert.equal(flash35.cache_read, 0.15);
+
+  // No independent official rate for the -n suffix; leave it unaliased rather
+  // than inventing a number or silently inheriting another SKU.
+  const suffixN = pricing.getModelPricingInfo("gemini-3.8-flash-n", { source: "antigravity" });
+  assert.equal(suffixN.status, "unpriced");
+  assert.equal(suffixN.input, 0);
+  assert.equal(suffixN.output, 0);
+  const effort = pricing.getModelPricingInfo("gemini-3.8-flash-high", { source: "antigravity" });
+  assert.equal(effort.status, "priced");
+  assert.equal(effort.input, 0.75);
+});
+
 test("matcher: lookupPricing fuzzy match restores `digit-digit` to `digit.digit` (droid GLM parity)", () => {
   // Droid dash-normalizes upstream `GLM-5.1` to `glm-5-1`, but curated keys
   // are dot-delimited. The matcher must retry a dot-restored variant of the
@@ -445,13 +504,26 @@ test("matcher: Antigravity model aliases only apply to Antigravity source", () =
 
 test("matcher: Antigravity model normalization covers families without gpt-4o fallback", () => {
   assert.equal(matcher.normalizeAntigravityModel("Gemini 3.5 Pro"), "gemini-2.5-pro");
-  assert.equal(matcher.normalizeAntigravityModel("Gemini 3.5 Flash"), "gemini-2.5-flash");
+  assert.equal(matcher.normalizeAntigravityModel("Gemini 3.5 Flash"), "gemini-3.5-flash");
   assert.equal(matcher.normalizeAntigravityModel("Claude Haiku 4.6"), "claude-haiku-4-6");
   assert.equal(
     matcher.normalizeAntigravityModel("gpt-oss-120b"),
     "antigravity-gpt-oss-120b",
   );
   assert.notEqual(matcher.normalizeAntigravityModel("gpt-oss-20b"), "gpt-4o");
+});
+
+test("matcher: Antigravity Gemini 3.x Flash keeps published names and rates (#1063)", () => {
+  assert.equal(matcher.normalizeAntigravityModel("gemini-3.8-flash"), "gemini-3.8-flash");
+  assert.equal(matcher.normalizeAntigravityModel("Gemini 3.8 Flash"), "gemini-3.8-flash");
+  assert.equal(matcher.normalizeAntigravityModel("gemini-3.7-flash"), "gemini-3.7-flash");
+  assert.equal(matcher.normalizeAntigravityModel("gemini-3.6-flash"), "gemini-3.6-flash");
+  assert.equal(matcher.normalizeAntigravityModel("gemini-3.5-flash"), "gemini-3.5-flash");
+  // No independent official SKU was published for the -n suffix; do not invent
+  // a dedicated rate or a special alias. The raw normalized id is preserved.
+  assert.equal(matcher.normalizeAntigravityModel("gemini-3.8-flash-n"), "gemini-3.8-flash-n");
+  // Confirmed Claude / gpt-oss aliases are unchanged.
+  assert.equal(matcher.normalizeAntigravityModel("Gemini 3.5 Pro"), "gemini-2.5-pro");
 });
 
 test("matcher: Zed model normalization maps display names + ids to pricing keys", () => {
